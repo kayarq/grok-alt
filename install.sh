@@ -49,6 +49,23 @@ ln -sfn "$INSTALL_DIR/bin/grok-alt" "$BIN_DIR/grok-alt"
 ln -sfn "$INSTALL_DIR/bin/grok-alt-tmux" "$BIN_DIR/grok-alt-tmux"
 
 echo
+echo "Verifying install …"
+if ! "$BIN_DIR/grok-alt" version >/dev/null; then
+  echo "ERROR: grok-alt failed to run after install." >&2
+  exit 1
+fi
+VER=$("$BIN_DIR/grok-alt" version)
+echo "  $VER — OK"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  :
+elif [[ -x "${GROK_BIN:-$HOME/.grok/bin/grok}" ]] || command -v grok >/dev/null 2>&1; then
+  echo "  tmux: found · Grok CLI: found — ready for:  grok-alt tmux"
+else
+  echo "  tmux: found · Grok CLI: not found (install Grok, or set GROK_BIN)"
+fi
+
+echo
 echo "Installed."
 echo "  App dir:   $INSTALL_DIR"
 echo "  Commands:  $BIN_DIR/grok-alt"

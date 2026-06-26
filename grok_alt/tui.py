@@ -1846,10 +1846,6 @@ class GrokAltApp(App):
         # Give a brief visual cue then exec
         self.exit(result=("exec", args, work_dir))
 
-    def action_web_viewer(self) -> None:
-        """Removed: this package is tmux/TUI only."""
-        self.notify("Web viewer not included in grok-alt (tmux/TUI only)", severity="warning")
-
 
     def action_export_turn(self) -> None:
         """Save selected turn as markdown: ## Prompt / ## Trace / ## Response."""
