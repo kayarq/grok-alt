@@ -17,6 +17,5 @@ venv/
 .env
 .env.*
 
-# Local overrides / logs
+# Local
 *.log
-.server.pid

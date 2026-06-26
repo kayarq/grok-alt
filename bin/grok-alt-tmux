@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# grok-alt-tmux — side-by-side: trace TUI (left) + real Grok (right)
+set -euo pipefail
+
+ROOT="${GROK_ALT_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+GROK_ALT="${GROK_ALT_BIN:-$ROOT/bin/grok-alt}"
+GROK_BIN="${GROK_BIN:-$HOME/.grok/bin/grok}"
+SESSION_NAME="${GROK_ALT_TMUX_SESSION:-grok-alt}"
+
+GROK_ARGS=("$@")
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is required. Install:  brew install tmux   (or your package manager)" >&2
+  exit 1
+fi
+
+if [[ ! -x "$GROK_ALT" ]]; then
+  echo "grok-alt launcher not found/executable: $GROK_ALT" >&2
+  exit 1
+fi
+
+if [[ ! -x "$GROK_BIN" ]] && ! command -v "$GROK_BIN" >/dev/null 2>&1; then
+  if command -v grok >/dev/null 2>&1; then
+    GROK_BIN="$(command -v grok)"
+  else
+    echo "Grok binary not found: $GROK_BIN (and 'grok' not on PATH)" >&2
+    exit 1
+  fi
+fi
+
+if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
+  echo "Attaching to existing tmux session: $SESSION_NAME"
+  echo "  (kill it first with:  tmux kill-session -t $SESSION_NAME)"
+  exec tmux attach-session -t "=$SESSION_NAME"
+fi
+
+tmux new-session -d -s "$SESSION_NAME" -n main -c "$PWD" \
+  "$GROK_ALT" tui
+
+tmux set-option -t "$SESSION_NAME" exit-empty off 2>/dev/null || true
+tmux set-option -t "$SESSION_NAME" mouse on 2>/dev/null || true
+tmux set-window-option -t "$SESSION_NAME:main" aggressive-resize off 2>/dev/null || true
+
+if ((${#GROK_ARGS[@]})); then
+  tmux split-window -h -t "$SESSION_NAME:main" -c "$PWD" -- "$GROK_BIN" "${GROK_ARGS[@]}"
+else
+  tmux split-window -h -t "$SESSION_NAME:main" -c "$PWD" -- "$GROK_BIN"
+fi
+
+tmux resize-pane -t "$SESSION_NAME:main.0" -x 42%
+tmux select-pane -t "$SESSION_NAME:main.1"
+
+tmux set-option -t "$SESSION_NAME" status-left "#[fg=cyan]grok-alt-tmux "
+tmux set-option -t "$SESSION_NAME" status-right "#[fg=yellow]drag border / mouse · Ctrl-b z zoom · d detach#[default]"
+
+exec tmux attach-session -t "=$SESSION_NAME"

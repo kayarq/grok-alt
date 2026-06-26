@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Install Grok Trace Viewer into ~/.local/share/grok-trace-viewer and put a
-# launcher on PATH (~/.local/bin/grok-trace-viewer).
+# Install grok-alt (tmux + TUI companion for Grok traces).
 set -euo pipefail
 
-REPO_URL="${GROK_TRACE_VIEWER_REPO:-https://github.com/haeiau1/grok-trace-viewer.git}"
-INSTALL_DIR="${GROK_TRACE_VIEWER_HOME:-$HOME/.local/share/grok-trace-viewer}"
+REPO_URL="${GROK_ALT_REPO:-https://github.com/haeiau1/grok-alt.git}"
+INSTALL_DIR="${GROK_ALT_HOME:-$HOME/.local/share/grok-alt}"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
-LAUNCHER="$BIN_DIR/grok-trace-viewer"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -18,6 +16,10 @@ need() {
 need git
 need python3
 
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "Warning: tmux not found. Install it for side-by-side mode (brew install tmux)." >&2
+fi
+
 mkdir -p "$BIN_DIR"
 
 if [[ -d "$INSTALL_DIR/.git" ]]; then
@@ -25,33 +27,47 @@ if [[ -d "$INSTALL_DIR/.git" ]]; then
   git -C "$INSTALL_DIR" pull --ff-only
 elif [[ -d "$INSTALL_DIR" ]]; then
   echo "Directory exists but is not a git repo: $INSTALL_DIR" >&2
-  echo "Move it aside or set GROK_TRACE_VIEWER_HOME to another path." >&2
+  echo "Move it aside or set GROK_ALT_HOME to another path." >&2
   exit 1
 else
   echo "Cloning into $INSTALL_DIR …"
-  git clone "$REPO_URL" "$INSTALL_DIR"
+  if ! git clone "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
+    FALLBACK="${GROK_ALT_REPO_FALLBACK:-https://github.com/haeiau1/grok-trace-viewer.git}"
+    echo "Primary clone failed, trying $FALLBACK …"
+    git clone "$FALLBACK" "$INSTALL_DIR"
+  fi
 fi
 
-chmod +x "$INSTALL_DIR/server.py" "$INSTALL_DIR/start.sh" "$INSTALL_DIR/install.sh"
+cd "$INSTALL_DIR"
+chmod +x bin/grok-alt bin/grok-alt-tmux install.sh 2>/dev/null || true
 
-cat > "$LAUNCHER" << LAUNCH
-#!/usr/bin/env bash
-exec python3 "$INSTALL_DIR/server.py" "\$@"
-LAUNCH
-chmod +x "$LAUNCHER"
+if [[ ! -d .venv ]]; then
+  echo "Creating Python venv …"
+  python3 -m venv .venv
+fi
+echo "Installing Python deps (textual, rich) …"
+.venv/bin/pip install -q --upgrade pip
+.venv/bin/pip install -q -r requirements.txt
+
+ln -sfn "$INSTALL_DIR/bin/grok-alt" "$BIN_DIR/grok-alt"
+ln -sfn "$INSTALL_DIR/bin/grok-alt-tmux" "$BIN_DIR/grok-alt-tmux"
 
 echo
 echo "Installed."
-echo "  App dir:  $INSTALL_DIR"
-echo "  Launcher: $LAUNCHER"
+echo "  App dir:   $INSTALL_DIR"
+echo "  Commands:  $BIN_DIR/grok-alt"
+echo "             $BIN_DIR/grok-alt-tmux"
 echo
-if ! command -v grok-trace-viewer >/dev/null 2>&1; then
+if ! command -v grok-alt >/dev/null 2>&1; then
   echo "Add this to your shell profile if $BIN_DIR is not on PATH:"
   echo "  export PATH=\"$BIN_DIR:\$PATH\""
   echo
 fi
-echo "Run:"
-echo "  grok-trace-viewer"
-echo "  # or:  $INSTALL_DIR/start.sh"
+echo "Quick start (tmux side-by-side — recommended):"
+echo "  grok-alt tmux"
+echo "  # or:  grok-alt-tmux"
 echo
-echo "Opens http://127.0.0.1:8765/ (stdlib Python only — no pip install)."
+echo "TUI only (no tmux):"
+echo "  grok-alt"
+echo
+echo "Requires Grok CLI on PATH or at ~/.grok/bin/grok"

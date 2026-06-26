@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# grok-alt — launch the Grok trace companion TUI (or tmux / list / …).
+set -euo pipefail
+
+# Prefer install location of this script; allow override for worktree installs.
+ROOT="${GROK_ALT_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+VENV="$ROOT/.venv"
+PY="$VENV/bin/python3"
+
+if [[ ! -x "$PY" ]]; then
+  echo "grok-alt: venv missing at $VENV" >&2
+  echo "  Run:  cd \"$ROOT\" && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m grok_alt "$@"

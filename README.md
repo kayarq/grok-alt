@@ -1,175 +1,197 @@
-# Grok Trace Viewer
+# grok-alt (tmux)
 
-A local web UI for reading [Grok](https://grok.x.ai) session traces and unified logs more easily.
+Companion **trace viewer in the terminal**, designed to run **side-by-side with real Grok in tmux**.
 
-Runs entirely on your machine (`127.0.0.1`). **Python 3 stdlib only** — no `pip install`, no Node, no database.
+Grok’s own UI is a closed binary (`~/.grok/bin/grok`). This tool does **not** modify it. It reads session files under `~/.grok/sessions/` and shows a readable timeline / chat / logs in a TUI on the **left** pane while you chat with Grok on the **right**.
 
-> **Note:** This is the **browser** trace viewer. For the terminal TUI and **side-by-side tmux** layout (traces | Grok), see the companion tool [`grok-alt`](https://github.com/haeiau1/grok-alt) if you publish it, or your local `~/.grok/worktrees/grok-alt` install. The web viewer works on its own.
+```
+┌──────────────────┬─────────────────────────────┐
+│  grok-alt (TUI)  │  real Grok agent            │
+│  traces / chat   │  type prompts here          │
+│  ~42% width      │  ~58% width                 │
+└──────────────────┴─────────────────────────────┘
+```
 
 ## Requirements
 
-- **Python 3.9+** (3.10+ recommended)
-- Grok installed so session data exists under `~/.grok/sessions/` (and optionally `~/.grok/logs/unified.jsonl`)
-- A modern browser
+| Need | Notes |
+|------|--------|
+| **tmux** | `brew install tmux` (macOS) or your distro package |
+| **Python 3.9+** | TUI uses `textual` and `rich` (installed into a local venv) |
+| **Grok CLI** | `grok` on `PATH` or `~/.grok/bin/grok` |
+| **git** | For clone / one-liner install |
 
 ## Install
 
-Pick one of the methods below.
+### Option A — One-liner (easiest for others)
 
-### Option A — One-liner install (recommended for others)
+```bash
+curl -fsSL https://raw.githubusercontent.com/haeiau1/grok-alt/main/install.sh | bash
+```
 
-After this repo is on GitHub under your account:
+If the GitHub repository is still named `grok-trace-viewer`, use:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/haeiau1/grok-trace-viewer/main/install.sh | bash
 ```
 
-That clones into `~/.local/share/grok-trace-viewer` and adds a `grok-trace-viewer` command under `~/.local/bin`.
+This will:
 
-Then run:
+1. Clone into `~/.local/share/grok-alt`
+2. Create a Python venv and install `requirements.txt`
+3. Symlink `grok-alt` and `grok-alt-tmux` into `~/.local/bin`
 
-```bash
-grok-trace-viewer
-```
-
-Ensure `~/.local/bin` is on your `PATH` (common on macOS/Linux). Add if needed:
+Put `~/.local/bin` on your `PATH` if needed:
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-**Update later:**
+**Update later** — run the same one-liner again, or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/haeiau1/grok-trace-viewer/main/install.sh | bash
-# or:
-git -C ~/.local/share/grok-trace-viewer pull
+git -C ~/.local/share/grok-alt pull
+~/.local/share/grok-alt/.venv/bin/pip install -r ~/.local/share/grok-alt/requirements.txt
 ```
 
-**Custom install location:**
+### Option B — Clone and install yourself
 
 ```bash
-GROK_TRACE_VIEWER_HOME=~/tools/grok-trace-viewer \
-  bash <(curl -fsSL https://raw.githubusercontent.com/haeiau1/grok-trace-viewer/main/install.sh)
+git clone https://github.com/haeiau1/grok-alt.git
+cd grok-alt
+
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+chmod +x bin/grok-alt bin/grok-alt-tmux
+
+# Optional: put on PATH
+mkdir -p ~/.local/bin
+ln -sfn "$(pwd)/bin/grok-alt" ~/.local/bin/grok-alt
+ln -sfn "$(pwd)/bin/grok-alt-tmux" ~/.local/bin/grok-alt-tmux
 ```
 
-### Option B — Clone and run (no install script)
-
-```bash
-git clone https://github.com/haeiau1/grok-trace-viewer.git
-cd grok-trace-viewer
-python3 server.py
-```
-
-Or:
-
-```bash
-./start.sh
-```
-
-Opens **http://127.0.0.1:8765/** in your browser.
+(Use the `grok-trace-viewer` GitHub URL instead if the repo has not been renamed yet — contents are the same.)
 
 ### Option C — Download ZIP (no git)
 
 1. On GitHub: **Code → Download ZIP**
-2. Unzip anywhere
-3. Run:
+2. Unzip, then from the folder:
 
 ```bash
-cd grok-trace-viewer-main   # folder name may include -main
-python3 server.py
-# or: ./start.sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+chmod +x bin/grok-alt bin/grok-alt-tmux
+./bin/grok-alt-tmux          # or: ./bin/grok-alt tmux
 ```
 
-### Option D — Use the copy you already have
+## Usage (tmux — main workflow)
 
 ```bash
-cd ~/Desktop/grok-trace-viewer   # or wherever you keep it
-python3 server.py
+grok-alt tmux              # recommended: traces | Grok
+# same thing:
+grok-alt-tmux
+
+# Pass flags through to Grok on the right pane:
+grok-alt tmux -- -c                 # continue latest Grok session
+grok-alt-tmux -c
+grok-alt-tmux -r <session-id>       # resume a specific session
 ```
 
-## Usage
+### tmux keys
+
+Prefix is usually **Ctrl-b**:
+
+| Keys | Action |
+|------|--------|
+| `Ctrl-b` then `←` / `→` | Switch between trace pane and Grok |
+| `Ctrl-b` then `z` | Zoom current pane fullscreen |
+| `Ctrl-b` then `d` | Detach (session keeps running) |
+| Mouse | Drag the pane border (mouse is enabled in the session) |
 
 ```bash
-python3 server.py                 # default port 8765, opens browser
-python3 server.py --port 9000     # different port
-python3 server.py --no-open       # don't auto-open browser
-python3 server.py --grok-home ~/.grok   # override GROK_HOME
+tmux attach -t grok-alt              # re-attach after detach
+tmux kill-session -t grok-alt        # fully quit both panes
 ```
 
-Stop with `Ctrl+C`.
+If a session named `grok-alt` already exists, the launcher **attaches** instead of starting a second one. Kill it first if you want a fresh layout.
 
-Environment:
+### TUI only (no tmux)
 
-| Variable | Meaning |
-|----------|---------|
-| `GROK_HOME` | Grok data root (default `~/.grok`) |
+```bash
+grok-alt              # open trace TUI alone
+grok-alt tui          # same
+grok-alt list         # print recent sessions (no UI)
+grok-alt version
+```
+
+## Keys inside the TUI (left pane)
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Browse sessions |
+| `Enter` | Load selected session (pins it; stops auto-jump) |
+| `1`–`5` | Timeline · Chat · Overview · Logs · Diffs |
+| `r` | Full refresh + re-follow newest session for this cwd |
+| `f` | Toggle **live follow** (on by default, ~1s poll) |
+| `/` | Filter sessions |
+| `p` | Toggle noisy phase events in timeline |
+| `t` | Toggle tool blocks in chat |
+| `d` | Export selected turn under `~/grok-turn-exports/` |
+| `g` | Exit TUI → launch real **Grok** (new session) |
+| `c` | Exit TUI → `grok -c` |
+| `R` | Exit TUI → `grok -r <selected-id>` |
+| `?` | Help |
+| `q` | Quit |
+
+**Live follow:** while Grok runs on the right, the left pane polls `~/.grok/sessions`, selects the newest session for your current directory, and refreshes views when files change. Status shows `[LIVE]`. Press `f` to pause, or pick another session to pin it. Override interval with `GROK_ALT_POLL_INTERVAL=0.5`.
 
 ## What it reads
 
-| Source | Path | What you get |
-|--------|------|----------------|
-| **Sessions** | `~/.grok/sessions/<cwd>/<session-id>/` | Full conversation traces |
-| **events.jsonl** | per session | Turn/tool/permission/phase lifecycle |
-| **updates.jsonl** | per session | ACP stream (user/agent/tool chunks) |
-| **chat_history.jsonl** | per session | Raw model chat messages |
-| **summary.json** | per session | Title, model, timestamps, counts |
-| **Unified log** | `~/.grok/logs/unified.jsonl` | Runtime telemetry (shell, pager, auth, MCP, …) |
+| Source | Path |
+|--------|------|
+| Sessions | `~/.grok/sessions/<cwd>/<session-id>/` |
+| Timeline | `events.jsonl` + `updates.jsonl` |
+| Chat | Rebuilt from `updates.jsonl` |
+| Runtime log | `~/.grok/logs/unified.jsonl` |
 
-## Views
+Override Grok’s data root with `GROK_HOME` if needed.
 
-### Timeline (default)
-Merged, color-coded stream of `events.jsonl` + `updates.jsonl`:
-- turns / loops
-- tool calls
-- agent / user messages
-- permissions
-- phases (hidden by default — toggle off “hide phases” to see them)
-- Click any card to expand full JSON
+## Environment variables
 
-### Chat
-Reconstructed conversation from `updates.jsonl` (fallback: `chat_history.jsonl`). Tool calls and results shown as blocks.
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `GROK_ALT_HOME` | directory containing `bin/` + `grok_alt/` | Install root |
+| `GROK_ALT_BIN` | `$GROK_ALT_HOME/bin/grok-alt` | TUI launcher (tmux script) |
+| `GROK_BIN` | `~/.grok/bin/grok` | Real Grok binary |
+| `GROK_ALT_TMUX_SESSION` | `grok-alt` | tmux session name |
+| `GROK_ALT_POLL_INTERVAL` | `1` | Live-follow poll seconds |
+| `GROK_HOME` | `~/.grok` | Sessions / logs root |
+| `GROK_ALT_TURN_EXPORT_DIR` | `~/grok-turn-exports` | Turn export destination |
 
-### Overview
-Session metadata, token/tool stats, event-type histograms, files in the session directory.
-
-### Unified Log
-Search/filter `~/.grok/logs/unified.jsonl` by text, `msg`, `src`, or session id. Click a row for full entry JSON. **Stats** shows top message types.
-
-## Tips
-
-1. **Pick the session** on the left (filter by title/cwd/id).
-2. Current session id is auto-filled into the log `sid` filter when you select it.
-3. For debugging MCP/auth/tools, use **Unified Log** with `msg` filters like `mcp`, `tool`, `auth`.
-4. For “what did the agent do?”, use **Timeline** + **Chat**.
-5. Hit **Refresh** (or restart the server) after new Grok activity if the session list looks stale.
-
-## Layout
+## Layout (repo)
 
 ```
-grok-trace-viewer/
-  server.py          # API + static file server (stdlib only)
-  start.sh           # local launcher
-  install.sh         # clone/update + PATH launcher for end users
-  static/index.html  # UI (single page)
+grok-alt/
+  bin/grok-alt           # CLI entry (uses .venv)
+  bin/grok-alt-tmux      # tmux side-by-side launcher
+  grok_alt/              # Python package (TUI + readers)
+  requirements.txt       # textual, rich
+  install.sh             # one-liner installer for end users
   README.md
   LICENSE
 ```
 
-## Privacy
-
-Runs only on `127.0.0.1`. Data never leaves your machine. Session files are read-only (the viewer does not modify Grok data).
-
 ## Uninstall
 
-If you used `install.sh`:
-
 ```bash
-rm -f ~/.local/bin/grok-trace-viewer
-rm -rf ~/.local/share/grok-trace-viewer
+rm -f ~/.local/bin/grok-alt ~/.local/bin/grok-alt-tmux
+rm -rf ~/.local/share/grok-alt
+# if you cloned elsewhere, delete that directory instead
 ```
 
-If you only cloned the repo, delete that directory.
+## Privacy
+
+Reads session files **locally** and never uploads them. Does not change Grok’s proprietary binary or rewrite session data (exports you trigger with `d` are written only where you configure).
 
 ## License
 
