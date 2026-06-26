@@ -31,11 +31,7 @@ elif [[ -d "$INSTALL_DIR" ]]; then
   exit 1
 else
   echo "Cloning into $INSTALL_DIR …"
-  if ! git clone "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
-    FALLBACK="${GROK_ALT_REPO_FALLBACK:-https://github.com/haeiau1/grok-trace-viewer.git}"
-    echo "Primary clone failed, trying $FALLBACK …"
-    git clone "$FALLBACK" "$INSTALL_DIR"
-  fi
+  git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
 cd "$INSTALL_DIR"

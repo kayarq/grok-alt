@@ -29,12 +29,6 @@ Grok’s own UI is a closed binary (`~/.grok/bin/grok`). This tool does **not** 
 curl -fsSL https://raw.githubusercontent.com/haeiau1/grok-alt/main/install.sh | bash
 ```
 
-If the GitHub repository is still named `grok-trace-viewer`, use:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/haeiau1/grok-trace-viewer/main/install.sh | bash
-```
-
 This will:
 
 1. Clone into `~/.local/share/grok-alt`
@@ -69,8 +63,6 @@ mkdir -p ~/.local/bin
 ln -sfn "$(pwd)/bin/grok-alt" ~/.local/bin/grok-alt
 ln -sfn "$(pwd)/bin/grok-alt-tmux" ~/.local/bin/grok-alt-tmux
 ```
-
-(Use the `grok-trace-viewer` GitHub URL instead if the repo has not been renamed yet — contents are the same.)
 
 ### Option C — Download ZIP (no git)
 
