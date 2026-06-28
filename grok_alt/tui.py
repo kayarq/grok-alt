@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from rich.markup import escape as rich_escape
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -106,13 +107,15 @@ class GrokAltApp(App):
     CSS = """
     Screen { background: #0d1117; width: 100%; height: 100%; }
 
+    /* Overlay so logo never steals layout rows / breaks RichLog resize */
     #app-logo {
-        dock: top;
-        align: right middle;
+        layer: overlay;
+        dock: right;
         width: 26;
         height: 13;
+        offset: 0 1;
         margin: 0 1 0 0;
-        background: #0d1117;
+        background: #0d1117 80%;
         color: #58a6ff;
     }
 
@@ -416,7 +419,10 @@ class GrokAltApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static(logo_mod.logo_renderable(), id="app-logo", markup=False)
+        try:
+            yield Static(logo_mod.logo_renderable(), id="app-logo", markup=False)
+        except Exception:
+            pass
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Input(placeholder="Filter sessions…  (/)", id="session-filter")
@@ -1142,7 +1148,21 @@ class GrokAltApp(App):
 
     @staticmethod
     def _escape(text: str) -> str:
-        return text.replace("[", "\\[")
+        """Escape for RichLog markup=True (tool titles often contain ``[`` / ``]``)."""
+        if text is None:
+            return ""
+        return rich_escape(str(text))
+
+    def _log_write(self, log: RichLog, line: str) -> None:
+        """Write to RichLog; never let a single bad line kill the app."""
+        try:
+            log.write(line)
+        except Exception:
+            try:
+                # Fallback: plain text, no markup interpretation
+                log.write(Text(str(line)))
+            except Exception:
+                pass
 
     @on(ListView.Selected, "#session-list")
     def on_session_selected(self, event: ListView.Selected) -> None:
@@ -1242,14 +1262,21 @@ class GrokAltApp(App):
 
     def render_timeline(self) -> None:
         log = self.query_one("#log-timeline", RichLog)
-        log.clear()
+        try:
+            log.clear()
+        except Exception:
+            pass
         sess_dir = self._sess_dir()
         if not sess_dir:
-            log.write("[red]Session path not found[/red]")
+            self._log_write(log, "[red]Session path not found[/red]")
             return
-        items = core.build_timeline(sess_dir, hide_phases=self.hide_phases)
+        try:
+            items = core.build_timeline(sess_dir, hide_phases=self.hide_phases)
+        except Exception as e:
+            self._log_write(log, f"[red]timeline error: {type(e).__name__}[/red]")
+            return
         if not items:
-            log.write("[dim]No timeline events[/dim]")
+            self._log_write(log, "[dim]No timeline events[/dim]")
             return
         cat_style = {
             "turn": "green",
@@ -1262,22 +1289,31 @@ class GrokAltApp(App):
             "meta": "blue",
             "other": "white",
         }
-        for it in items:
+        # Cap rows so huge sessions cannot OOM / hang the left pane
+        max_items = 800
+        shown = items[-max_items:] if len(items) > max_items else items
+        for it in shown:
             style = cat_style.get(it.get("category", "other"), "white")
-            ts = core.fmt_time(it.get("ts"))
+            ts = self._escape(core.fmt_time(it.get("ts")))
             title = self._escape(it.get("title") or "")
-            log.write(f"[dim]{ts}[/dim] [{style}]●[/{style}] {title}")
+            self._log_write(log, f"[dim]{ts}[/dim] [{style}]●[/{style}] {title}")
             detail = it.get("detail")
             if detail:
                 lines = str(detail).splitlines() or [str(detail)]
                 for i, line in enumerate(lines[:3]):
                     d = self._escape(line[:200])
-                    log.write(f"         [dim]{d}[/dim]")
+                    self._log_write(log, f"         [dim]{d}[/dim]")
                 if len(lines) > 3:
-                    log.write(f"         [dim]… +{len(lines) - 3} more (see Chat tab for full tool trace)[/dim]")
-        log.write(
-            f"\n[dim]{len(items)} items · phases {'hidden' if self.hide_phases else 'shown'} · "
-            f"press p to toggle · Chat tab has full tool diffs/reads[/dim]"
+                    self._log_write(
+                        log,
+                        f"         [dim]… +{len(lines) - 3} more (see Chat tab for full tool trace)[/dim]",
+                    )
+        extra = f" (showing last {max_items})" if len(items) > max_items else ""
+        self._log_write(
+            log,
+            f"\n[dim]{len(items)} items{extra} · phases "
+            f"{'hidden' if self.hide_phases else 'shown'} · "
+            f"press p to toggle · Chat tab has full tool diffs/reads[/dim]",
         )
 
     def render_chat(self, *, force: bool = True) -> None:
