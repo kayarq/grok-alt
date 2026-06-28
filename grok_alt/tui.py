@@ -33,7 +33,6 @@ from textual.widgets import (
 
 from . import core
 from . import pretty
-from . import logo as logo_mod
 
 # Live-follow poll interval (seconds). Slightly gentler default — full chat remounts are expensive.
 LIVE_POLL_INTERVAL = float(os.environ.get("GROK_ALT_POLL_INTERVAL", "1.5"))
@@ -107,17 +106,6 @@ class GrokAltApp(App):
     CSS = """
     Screen { background: #0d1117; width: 100%; height: 100%; }
 
-    /* Overlay so logo never steals layout rows / breaks RichLog resize */
-    #app-logo {
-        layer: overlay;
-        dock: right;
-        width: 26;
-        height: 13;
-        offset: 0 1;
-        margin: 0 1 0 0;
-        background: #0d1117 80%;
-        color: #58a6ff;
-    }
 
     #sidebar {
         width: 30%;
@@ -420,10 +408,6 @@ class GrokAltApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        try:
-            yield Static(logo_mod.logo_renderable(), id="app-logo", markup=False)
-        except Exception:
-            pass
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Input(placeholder="Filter sessions…  (/)", id="session-filter")
