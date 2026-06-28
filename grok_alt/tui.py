@@ -33,8 +33,10 @@ from textual.widgets import (
 from . import core
 from . import pretty
 
-# Live-follow poll interval (seconds). Fast enough for tmux side-by-side use.
-LIVE_POLL_INTERVAL = float(os.environ.get("GROK_ALT_POLL_INTERVAL", "1.0"))
+# Live-follow poll interval (seconds). Slightly gentler default — full chat remounts are expensive.
+LIVE_POLL_INTERVAL = float(os.environ.get("GROK_ALT_POLL_INTERVAL", "1.5"))
+# Placeholder inside collapsed tools (full Rich body only mounted when expanded).
+_TOOL_BODY_PLACEHOLDER = "[dim]Expand for full tool output…[/dim]"
 
 
 class HelpScreen(ModalScreen[None]):
@@ -378,7 +380,10 @@ class GrokAltApp(App):
         self._tool_focus_idx: int = -1
         self._expand_session_id: str | None = None  # reset expand state on session switch
         self._rendering_chat = False
-        self._last_chat_fp = ""  # skip expensive chat rebuild when unchanged
+        self._last_chat_fp = ""  # session data fingerprint (not expand state)
+        self._last_chat_structure_sig = ""  # roles/tool ids — skip full remount when stable
+        self._chat_msgs: list[dict] = []  # last built message list (for lazy tool fill)
+        self._tool_body_filled: set[str] = set()  # widget ids with full body mounted
         self._diff_files: list[dict] = []  # session file changes for Diffs tab
         self._diff_by_id: dict[str, dict] = {}
         self._diff_selected_path: str | None = None
@@ -629,23 +634,13 @@ class GrokAltApp(App):
                     continue
                 try:
                     col = self.query_one(f"#{wid}", Collapsible)
+                    if not collapsed:
+                        self._fill_tool_body(wid, t.get("msg") or {})
                     if col.collapsed != collapsed:
                         col.collapsed = collapsed
                     updated += 1
                 except Exception:
                     continue
-
-            # Keep cache in sync so live refresh doesn't immediately rebuild
-            sess_dir = self._sess_dir()
-            if sess_dir:
-                fp = core.session_fingerprint(sess_dir) or ""
-                if self.hide_tools_in_chat:
-                    fp += "|hide_tools"
-                if self._tools_expand_all:
-                    fp += "|expand_all"
-                else:
-                    fp += "|" + ",".join(sorted(self._tools_expanded)[:40])
-                self._last_chat_fp = fp
         finally:
             self._rendering_chat = False
 
@@ -655,9 +650,110 @@ class GrokAltApp(App):
         else:
             self.set_status(f"Expanded {updated}/{n} tools — click a row or Collapse all to close")
 
+    def _tool_placeholder_static(self) -> Static:
+        return Static(
+            _TOOL_BODY_PLACEHOLDER,
+            classes="tool-body",
+            markup=True,
+            shrink=True,
+        )
+
+    def _tool_detail_renderable(self, msg: dict):
+        try:
+            return pretty.render_tool_detail(msg)
+        except Exception:
+            return self._tool_detail_markup(msg)
+
+    def _fill_tool_body(self, wid: str, msg: dict, *, force: bool = False) -> None:
+        """Mount full tool detail into an existing Collapsible (lazy — skip if already filled)."""
+        if not wid:
+            return
+        if not force and wid in self._tool_body_filled:
+            return
+        try:
+            col = self.query_one(f"#{wid}", Collapsible)
+        except Exception:
+            return
+        detail = self._tool_detail_renderable(msg)
+        try:
+            # Replace children with one Static holding the full renderable
+            for child in list(col.children):
+                try:
+                    child.remove()
+                except Exception:
+                    pass
+            col.mount(Static(detail, classes="tool-body", markup=False, shrink=True))
+            self._tool_body_filled.add(wid)
+        except Exception:
+            try:
+                col.mount(Static(self._tool_detail_markup(msg), classes="tool-body", markup=True, shrink=True))
+                self._tool_body_filled.add(wid)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _chat_structure_sig(msgs: list[dict]) -> str:
+        """Cheap signature: when stable, live updates can patch tools in place (no remount)."""
+        parts: list[str] = []
+        tool_i = 0
+        for m in msgs:
+            role = m.get("role") or "?"
+            if role == "tool":
+                tool_i += 1
+                tid = m.get("tool_call_id") or f"i{tool_i}"
+                parts.append(
+                    f"t:{tid}:{m.get('status') or ''}:"
+                    f"{(m.get('summary') or '')[:64]}:{(m.get('label') or '')[:24]}"
+                )
+            elif role == "user":
+                t = m.get("text") or ""
+                parts.append(f"u:{len(t)}:{hash(t) & 0xFFFF:x}")
+            elif role in ("assistant", "agent"):
+                t = m.get("text") or ""
+                parts.append(f"a:{len(t)}:{hash(t) & 0xFFFF:x}")
+            elif role == "system":
+                parts.append(f"s:{(m.get('text') or '')[:40]}")
+            else:
+                parts.append(role)
+        return "|".join(parts)
+
+    def _patch_chat_tools_in_place(self, msgs: list[dict]) -> bool:
+        """Update tool titles/data without tearing down the chat widget tree. Returns False if must remount."""
+        if self.hide_tools_in_chat:
+            return False
+        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+        if len(tool_msgs) != len(self._chat_tools):
+            return False
+        for t, m in zip(self._chat_tools, tool_msgs):
+            key = t.get("key")
+            tid = m.get("tool_call_id")
+            old_tid = (t.get("msg") or {}).get("tool_call_id")
+            if tid and old_tid and tid != old_tid:
+                return False
+            t["msg"] = m
+            wid = t.get("widget_id")
+            if not wid:
+                continue
+            title = self._tool_collapsible_title(m, tool_num=int(t.get("num") or 1))
+            try:
+                col = self.query_one(f"#{wid}", Collapsible)
+                col.title = title
+                # Refresh body only if user already has it open (keeps live accuracy without cost for collapsed)
+                if not col.collapsed or self._is_tool_expanded(key or ""):
+                    self._tool_body_filled.discard(wid)
+                    self._fill_tool_body(wid, m, force=True)
+            except Exception:
+                return False
+        self._chat_msgs = msgs
+        # Prompt texts may grow in-place rarely; refresh nav without list thrash when possible
+        prompts = [m.get("text") or "" for m in msgs if m.get("role") == "user"]
+        self._prompt_texts = prompts
+        self._render_prompt_nav(prompts)
+        return True
+
     @on(Collapsible.Expanded)
     def on_tool_collapsible_expanded(self, event: Collapsible.Expanded) -> None:
-        """Keep expand-state in sync when user clicks a tool row open."""
+        """Keep expand-state in sync when user clicks a tool row open; lazy-load full body."""
         if self._rendering_chat:
             return
         w = event.collapsible
@@ -669,10 +765,13 @@ class GrokAltApp(App):
             return
         if not self._tools_expand_all:
             self._tools_expanded.add(key)
+        msg = {}
         for i, t in enumerate(self._chat_tools):
             if t.get("key") == key:
                 self._tool_focus_idx = i
+                msg = t.get("msg") or {}
                 break
+        self._fill_tool_body(wid, msg)
         try:
             label = getattr(event.collapsible, "title", None) or key
             self.set_status(f"Tool expanded (click title again to collapse) · {str(label)[:55]}")
@@ -699,6 +798,18 @@ class GrokAltApp(App):
             }
         else:
             self._tools_expanded.discard(key)
+        # Drop heavy body to free memory; next expand refills (placeholder stays until then)
+        try:
+            if wid in self._tool_body_filled:
+                for child in list(w.children):
+                    try:
+                        child.remove()
+                    except Exception:
+                        pass
+                w.mount(self._tool_placeholder_static())
+                self._tool_body_filled.discard(wid)
+        except Exception:
+            pass
         try:
             self.set_status("Tool collapsed — click another ▸ row or use Expand all tools")
         except Exception:
@@ -840,6 +951,9 @@ class GrokAltApp(App):
             self._tools_expanded.clear()
             self._tool_focus_idx = -1
             self._last_chat_fp = ""
+            self._last_chat_structure_sig = ""
+            self._chat_msgs = []
+            self._tool_body_filled.clear()
             self._selected_prompt_index = None  # new session → re-resolve prompt for diffs
             self._diff_selected_path = None
             self._last_prompt_nav_key = None  # force prompt ListView rebuild
@@ -986,7 +1100,8 @@ class GrokAltApp(App):
 
     def _live_tick_inner(self, *, force: bool = False) -> None:
         try:
-            sessions = core.list_sessions()
+            # Light index for poll (no full line_count over every session file)
+            sessions = core.list_sessions_light() if not force else core.list_sessions()
         except Exception:
             return
         index_fp = core.sessions_index_fingerprint(sessions)
@@ -1037,9 +1152,11 @@ class GrokAltApp(App):
             # (avoids remounting 100+ collapsibles every second → crash/freeze in tmux)
             try:
                 if session_changed or force:
+                    # Full panes + chat; chat still uses incremental patch when structure stable
                     self.load_selected_views(force=True)
                 else:
-                    self.render_logs()
+                    # Lightweight live tick: timeline/logs + incremental chat (no full remount storm)
+                    self.load_selected_views(force=False, chat_only_if_needed=True)
             except Exception:
                 pass
             live_tag = "LIVE" if self.live_follow else "paused"
@@ -1047,7 +1164,7 @@ class GrokAltApp(App):
             try:
                 self.set_status(
                     f"[{live_tag}] {sid[:8] if sid else '—'}… · {title} · "
-                    f"auto-refresh {LIVE_POLL_INTERVAL:.0f}s · click tools · r refresh"
+                    f"auto-refresh {LIVE_POLL_INTERVAL:.0f}s · expand tools · r refresh"
                 )
             except Exception:
                 pass
@@ -1089,23 +1206,52 @@ class GrokAltApp(App):
                 self._last_unified_mtime_ns = core.UNIFIED_LOG.stat().st_mtime_ns
         except OSError:
             pass
-        # Guard each pane so one failure (e.g. huge chat remount) doesn't kill the app
-        for name, fn in (
+        # Heavy panes: skip on lightweight live ticks when only session files changed
+        # (chat handles its own incremental path). Force / session switch still paints all.
+        paint_all = force or not chat_only_if_needed
+        panes = (
             ("timeline", self.render_timeline),
             ("overview", self.render_overview),
             ("logs", self.render_logs),
             ("diffs", self.render_diffs),
-        ):
-            try:
-                fn()
-            except Exception as e:
+        )
+        if paint_all:
+            for name, fn in panes:
                 try:
-                    self.set_status(f"{name} render error: {type(e).__name__}")
+                    fn()
+                except Exception as e:
+                    try:
+                        self.set_status(f"{name} render error: {type(e).__name__}")
+                    except Exception:
+                        pass
+        else:
+            # Live: timeline + logs are cheap RichLog clears; skip overview/diffs unless on that tab
+            try:
+                tabs = self.query_one(TabbedContent)
+                active = tabs.active
+            except Exception:
+                active = "timeline"
+            try:
+                self.render_timeline()
+            except Exception:
+                pass
+            try:
+                self.render_logs()
+            except Exception:
+                pass
+            if active == "overview":
+                try:
+                    self.render_overview()
                 except Exception:
                     pass
-        # Chat is expensive (many collapsibles); only rebuild when data changed or forced
+            elif active == "diffs":
+                try:
+                    self.render_diffs()
+                except Exception:
+                    pass
+        # Chat: prefer incremental patch; full remount only when structure changes or forced
         try:
-            self.render_chat(force=force or not chat_only_if_needed)
+            self.render_chat(force=force)
         except Exception as e:
             try:
                 self.set_status(f"chat render error: {type(e).__name__}: {e}")
@@ -1165,7 +1311,7 @@ class GrokAltApp(App):
         )
 
     def render_chat(self, *, force: bool = True) -> None:
-        """Rebuild chat stream: user/agent as Static blocks; tools as clickable Collapsibles."""
+        """Chat stream: incremental when structure stable; lazy full tool bodies on expand."""
         if self._rendering_chat:
             return
         sess_dir = self._sess_dir()
@@ -1174,12 +1320,51 @@ class GrokAltApp(App):
             chat_fp = core.session_fingerprint(sess_dir) or ""
             if self.hide_tools_in_chat:
                 chat_fp += "|hide_tools"
-            if self._tools_expand_all:
-                chat_fp += "|expand_all"
-            else:
-                chat_fp += "|" + ",".join(sorted(self._tools_expanded)[:40])
-        if not force and chat_fp and chat_fp == self._last_chat_fp:
+        # Unchanged session files and not forced → nothing to do (expand state is not in fp)
+        if not force and chat_fp and chat_fp == self._last_chat_fp and self._chat_tools:
             return
+
+        self._reset_tool_expand_if_session_changed()
+
+        if not sess_dir:
+            stream = self.query_one("#chat-stream", VerticalScroll)
+            self._rendering_chat = True
+            try:
+                stream.remove_children()
+                stream.mount(
+                    Static("[red]Session path not found[/red]", classes="chat-block", markup=True)
+                )
+                self._chat_tools = []
+                self._tool_id_to_key = {}
+                self._tool_body_filled.clear()
+                self._chat_msgs = []
+                self._last_chat_structure_sig = ""
+                self._render_prompt_nav([])
+            finally:
+                self._rendering_chat = False
+            return
+
+        try:
+            msgs = core.build_chat_view(
+                sess_dir,
+                max_output_file_chars=core.TOOL_FULL_CHARS,
+                full_detail=True,
+            )
+        except Exception as e:
+            self.set_status(f"chat build error: {type(e).__name__}: {e}")
+            return
+
+        struct_sig = self._chat_structure_sig(msgs)
+        # Same shape of conversation → patch tool titles/bodies in place (fast live path)
+        if (
+            not force
+            and struct_sig
+            and struct_sig == self._last_chat_structure_sig
+            and self._chat_tools
+        ):
+            if self._patch_chat_tools_in_place(msgs):
+                self._last_chat_fp = chat_fp
+                return
 
         stream = self.query_one("#chat-stream", VerticalScroll)
         self._rendering_chat = True
@@ -1192,23 +1377,14 @@ class GrokAltApp(App):
             self._prompt_texts = []
             self._chat_tools = []
             self._tool_id_to_key = {}
-            self._reset_tool_expand_if_session_changed()
+            self._tool_body_filled.clear()
+            self._chat_msgs = msgs
 
-            if not sess_dir:
-                stream.mount(
-                    Static("[red]Session path not found[/red]", classes="chat-block", markup=True)
-                )
-                self._render_prompt_nav([])
-                return
-
-            msgs = core.build_chat_view(
-                sess_dir,
-                max_output_file_chars=core.TOOL_FULL_CHARS,
-                full_detail=True,
-            )
             if not msgs:
                 stream.mount(Static("[dim]No chat content[/dim]", classes="chat-block", markup=True))
                 self._render_prompt_nav([])
+                self._last_chat_fp = chat_fp
+                self._last_chat_structure_sig = struct_sig
                 return
 
             user_total = self._count_user_msgs(msgs)
@@ -1256,18 +1432,25 @@ class GrokAltApp(App):
                     self._tool_id_to_key[wid] = key
                     self._chat_tools.append({"key": key, "msg": m, "widget_id": wid, "num": tool_n})
                     title = self._tool_collapsible_title(m, tool_num=tool_n)
-                    # Rich renderable: syntax highlight, colored paths/grep/diff (Grok-TUI style+)
-                    try:
-                        detail = pretty.render_tool_detail(m)
-                    except Exception:
-                        detail = self._tool_detail_markup(m)
+                    # Lazy body: placeholder until expand (or pre-fill if already expanded)
+                    if expanded:
+                        body_widget: Static = Static(
+                            self._tool_detail_renderable(m),
+                            classes="tool-body",
+                            markup=False,
+                            shrink=True,
+                        )
+                    else:
+                        body_widget = self._tool_placeholder_static()
                     col = Collapsible(
-                        Static(detail, classes="tool-body", markup=False, shrink=True),
+                        body_widget,
                         title=title,
                         collapsed=not expanded,
                         id=wid,
                     )
                     stream.mount(col)
+                    if expanded:
+                        self._tool_body_filled.add(wid)
                 elif role == "system":
                     stream.mount(
                         Static(
@@ -1285,21 +1468,20 @@ class GrokAltApp(App):
             stream.mount(
                 Static(
                     f"[dim]{count} blocks · {user_n} prompt(s) · {n_tools} tool(s) "
-                    f"({n_open} open) · click tool row to expand · toolbar = all[/dim]",
+                    f"({n_open} open) · expand = full output · toolbar = all[/dim]",
                     classes="chat-footer",
                     markup=True,
                     shrink=True,
                 )
             )
             self._render_prompt_nav(self._prompt_texts)
-            # Default diffs scope to last prompt when user hasn't picked one yet
             if self._prompt_texts and self._selected_prompt_index is None:
                 self._selected_prompt_index = len(self._prompt_texts) - 1
             elif self._selected_prompt_index is not None and self._prompt_texts:
-                # Clamp if session shrank
                 if self._selected_prompt_index >= len(self._prompt_texts):
                     self._selected_prompt_index = len(self._prompt_texts) - 1
             self._last_chat_fp = chat_fp
+            self._last_chat_structure_sig = struct_sig
         finally:
             self._rendering_chat = False
         if self._pending_prompt_jump is not None:

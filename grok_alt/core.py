@@ -177,10 +177,58 @@ def sessions_index_fingerprint(sessions: list[dict] | None = None) -> str:
     # First 12 newest are enough for live-follow in tmux
     parts = []
     for s in sessions[:12]:
+        # Prefer cheap metadata over line counts (list_sessions may still count lines once)
         parts.append(
             f"{s.get('id')}:{s.get('updated_at') or ''}:{s.get('events_count')}:{s.get('updates_count')}"
         )
     return "|".join(parts)
+
+
+def list_sessions_light() -> list[dict]:
+    """Like list_sessions but skip per-file line counts (faster live poll / sidebar)."""
+    sessions: list[dict] = []
+    if not SESSIONS_DIR.exists():
+        return sessions
+
+    for cwd_dir in sorted(SESSIONS_DIR.iterdir()):
+        if not cwd_dir.is_dir() or cwd_dir.name.startswith("."):
+            continue
+        if cwd_dir.name == "session_search.sqlite":
+            continue
+        cwd = decode_cwd_key(cwd_dir.name)
+        for sess_dir in sorted(cwd_dir.iterdir(), reverse=True):
+            if not sess_dir.is_dir() or not UUID_RE.match(sess_dir.name):
+                continue
+            summary = load_json(sess_dir / "summary.json") or {}
+            info = summary.get("info") or {}
+            sessions.append(
+                {
+                    "id": sess_dir.name,
+                    "cwd": info.get("cwd") or cwd,
+                    "cwd_key": cwd_dir.name,
+                    "title": summary.get("generated_title")
+                    or summary.get("session_summary")
+                    or "(untitled)",
+                    "summary": summary.get("session_summary"),
+                    "created_at": summary.get("created_at"),
+                    "updated_at": summary.get("updated_at")
+                    or summary.get("last_active_at"),
+                    "model": summary.get("current_model_id"),
+                    "agent_name": summary.get("agent_name"),
+                    "num_messages": summary.get("num_messages"),
+                    "num_chat_messages": summary.get("num_chat_messages"),
+                    "events_count": 0,
+                    "updates_count": 0,
+                    "signals": {},
+                    "path": str(sess_dir),
+                }
+            )
+
+    sessions.sort(
+        key=lambda s: s.get("updated_at") or s.get("created_at") or "",
+        reverse=True,
+    )
+    return sessions
 
 
 def prefer_session_for_cwd(sessions: list[dict], cwd: str | None = None) -> dict | None:
