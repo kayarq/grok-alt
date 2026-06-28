@@ -32,7 +32,7 @@ from textual.widgets import (
 
 from . import core
 from . import pretty
-from . import themes
+from . import logo as logo_mod
 
 # Live-follow poll interval (seconds). Slightly gentler default — full chat remounts are expensive.
 LIVE_POLL_INTERVAL = float(os.environ.get("GROK_ALT_POLL_INTERVAL", "1.5"))
@@ -83,7 +83,6 @@ class HelpScreen(ModalScreen[None]):
   [ / ]          Move tool focus in chat
   f              Toggle live auto-follow (on by default)
   q / Ctrl+C     Quit (in tmux: ends whole grok-alt session → back to shell)
-  m              Cycle theme: Night → Day → Indigo/forest (saved under ~/.config/grok-alt/)
 
 [dim]Live mode polls session files so traces update while you chat.
 Select a prompt to scroll there and expand that turn's tools. Official Grok: g / c / R.[/dim]
@@ -104,14 +103,196 @@ class GrokAltApp(App):
 
     TITLE = "grok-alt"
     SUB_TITLE = "trace TUI · companion to Grok"
-    CSS = themes.APP_CSS
+    CSS = """
+    Screen { background: #0d1117; width: 100%; height: 100%; }
+
+    #app-logo {
+        dock: top;
+        align: right middle;
+        width: 26;
+        height: 13;
+        margin: 0 1 0 0;
+        background: #0d1117;
+        color: #58a6ff;
+    }
+
+    #sidebar {
+        width: 30%;
+        min-width: 18;
+        max-width: 36;
+        background: #161b22;
+        border-right: solid #30363d;
+    }
+
+    #main {
+        width: 1fr;
+        min-width: 20;
+        overflow-x: auto;
+    }
+
+    #session-filter { margin: 0 1; dock: top; }
+    #session-list { height: 1fr; }
+
+    ListView { background: #161b22; }
+    ListItem { padding: 0 1; }
+    ListItem.--highlight { background: #1c2d41; }
+
+    #status-line {
+        dock: bottom;
+        height: 1;
+        background: #161b22;
+        color: #8b949e;
+        padding: 0 1;
+    }
+
+    TabbedContent { height: 1fr; width: 100%; }
+    TabPane { width: 100%; height: 1fr; }
+
+    RichLog {
+        background: #0d1117;
+        color: #e6edf3;
+        height: 1fr;
+        width: 100%;
+        min-width: 1;
+        border: none;
+        scrollbar-background: #161b22;
+        scrollbar-color: #30363d;
+        overflow-x: auto;
+    }
+
+    #chat-pane { height: 1fr; width: 100%; }
+    #prompt-nav-wrap {
+        height: 14;
+        min-height: 8;
+        max-height: 18;
+        width: 100%;
+        background: #161b22;
+        border-bottom: solid #30363d;
+        layout: vertical;
+    }
+    #prompt-nav-header {
+        height: 1;
+        padding: 0 1;
+        color: #8b949e;
+        background: #21262d;
+        dock: top;
+    }
+    #prompt-nav {
+        height: 1fr;
+        min-height: 6;
+        background: #161b22;
+        overflow-y: auto;
+        scrollbar-background: #161b22;
+        scrollbar-color: #30363d;
+    }
+    #prompt-nav ListItem { padding: 0 1; height: 2; }
+    #prompt-nav ListItem.--highlight { background: #238636; }
+
+    #chat-toolbar {
+        height: auto;
+        min-height: 3;
+        max-height: 5;
+        width: 100%;
+        padding: 0 1;
+        background: #21262d;
+        border-bottom: solid #30363d;
+        overflow-x: auto;
+    }
+    #chat-toolbar Button { margin: 0 1 0 0; min-width: 12; max-width: 22; }
+    #chat-toolbar-hint { color: #8b949e; padding: 0 1; width: 1fr; min-width: 0; }
+    #chat-stream {
+        height: 1fr;
+        width: 100%;
+        min-width: 1;
+        background: #0d1117;
+        padding: 0 1 1 1;
+        scrollbar-background: #161b22;
+        scrollbar-color: #30363d;
+        overflow-x: hidden;
+        overflow-y: auto;
+    }
+    #chat-stream .chat-block { width: 100%; max-width: 100%; margin: 0 0 1 0; padding: 0 1; }
+    #chat-stream .chat-user {
+        width: 100%;
+        background: #12261e;
+        border-left: solid #3fb950;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    #chat-stream .chat-agent {
+        width: 100%;
+        background: #0d1b2a;
+        border-left: solid #58a6ff;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    #chat-stream .chat-system { width: 100%; color: #8b949e; margin: 0 0 1 0; }
+    #chat-stream Collapsible {
+        width: 100%;
+        max-width: 100%;
+        margin: 0 0 1 0;
+        background: #161b22;
+        border-left: solid #d29922;
+        padding: 0;
+    }
+    #chat-stream CollapsibleTitle {
+        width: 100%;
+        max-width: 100%;
+        background: #21262d;
+        color: #e6edf3;
+        overflow: hidden;
+    }
+    #chat-stream CollapsibleTitle:hover { background: #30363d; color: #f0e68c; }
+    #chat-stream .tool-body {
+        width: 100%;
+        max-width: 100%;
+        padding: 0 1 1 2;
+        background: #0d1117;
+    }
+    #chat-stream .chat-footer { width: 100%; color: #8b949e; margin-top: 1; }
+
+    #diffs-pane { height: 1fr; width: 100%; }
+    #diff-files-wrap {
+        width: 32%;
+        min-width: 16;
+        max-width: 42;
+        background: #161b22;
+        border-right: solid #30363d;
+    }
+    #diff-files-header { height: 1; padding: 0 1; color: #8b949e; background: #21262d; }
+    #diff-file-list { height: 1fr; background: #161b22; }
+    #diff-file-list ListItem { padding: 0 1; height: 3; }
+    #diff-file-list ListItem.--highlight { background: #1f3d2a; }
+    #diff-detail-wrap { width: 1fr; min-width: 20; background: #0d1117; }
+    #diff-detail-header {
+        height: auto;
+        min-height: 2;
+        max-height: 4;
+        padding: 0 1;
+        color: #e6edf3;
+        background: #21262d;
+        border-bottom: solid #30363d;
+    }
+    #diff-detail-scroll { height: 1fr; width: 100%; padding: 0 1 1 1; background: #0d1117; }
+    #diff-detail-body { width: 100%; }
+
+    #help-dialog {
+        width: 72;
+        height: auto;
+        max-height: 90%;
+        background: #161b22;
+        border: solid #58a6ff;
+        padding: 1 2;
+    }
+    #help-title { color: #58a6ff; margin-bottom: 1; }
+    #help-body { color: #e6edf3; }
+    """
 
     # priority=True: work even when focus is on ListView / Input / RichLog (tmux UX)
     BINDINGS = [
         Binding("q", "quit_app", "Quit", priority=True),
         Binding("ctrl+c", "quit_app", "Quit", show=False, priority=True),
         Binding("question_mark", "help", "Help", priority=True),
-        Binding("m", "cycle_theme", "Theme", priority=True),
         Binding("r", "refresh", "Refresh", priority=True),
         Binding("f", "toggle_live", "Live", priority=True),
         Binding("g", "launch_grok", "Grok", priority=True),
@@ -182,8 +363,6 @@ class GrokAltApp(App):
         self._populating_prompts = False
         self._pending_prompt_jump: int | None = None
         self._last_prompt_nav_key: tuple | None = None  # skip ListView rebuild when unchanged
-        self._ui_theme: str = themes.load_theme()
-        themes.set_active_theme(self._ui_theme)
 
     @staticmethod
     def _safe_list_index(lv: ListView, index: int | None) -> None:
@@ -237,6 +416,7 @@ class GrokAltApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Static(logo_mod.logo_renderable(), id="app-logo", markup=False)
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Input(placeholder="Filter sessions…  (/)", id="session-filter")
@@ -307,52 +487,12 @@ class GrokAltApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._apply_theme(self._ui_theme, persist=False, notify=False)
         self.refresh_sessions(auto_select=True)
         self._start_live_poll()
-        label = themes.THEME_LABELS.get(self._ui_theme, self._ui_theme)
         self.set_status(
-            f"GROK_HOME={core.GROK_HOME} · theme={label} · "
-            f"live={'on' if self.live_follow else 'off'} · m theme · ? help · q quit"
+            f"GROK_HOME={core.GROK_HOME} · sessions={'ok' if core.SESSIONS_DIR.exists() else 'missing'} · "
+            f"live={'on' if self.live_follow else 'off'} · ? help · q quit"
         )
-
-    def _apply_theme(self, name: str, *, persist: bool = True, notify: bool = True) -> None:
-        """Set Screen class theme-* and sync Rich text palettes (pretty / timeline)."""
-        name = themes.normalize_theme(name)
-        self._ui_theme = name
-        themes.set_active_theme(name)
-        try:
-            screen = self.screen
-            for tid in themes.THEME_IDS:
-                screen.remove_class(f"theme-{tid}")
-            screen.add_class(themes.theme_class(name))
-        except Exception:
-            pass
-        if persist:
-            themes.save_theme(name)
-        # Re-paint content that embeds Rich styles (not only chrome CSS)
-        try:
-            self._last_chat_fp = ""
-            self._last_chat_structure_sig = ""
-            if self.selected:
-                self.render_timeline()
-                self.render_chat(force=True)
-                self.render_overview()
-                self.render_logs()
-                self.render_diffs()
-        except Exception:
-            pass
-        label = themes.THEME_LABELS.get(name, name)
-        if notify:
-            try:
-                self.notify(f"Theme: {label}")
-                self.set_status(f"Theme: {label} · m cycles · fonts+panes update")
-            except Exception:
-                pass
-
-    def action_cycle_theme(self) -> None:
-        nxt = themes.next_theme(self._ui_theme)
-        self._apply_theme(nxt, persist=True, notify=True)
 
     def _start_live_poll(self) -> None:
         if self._poll_timer is not None:
@@ -372,28 +512,6 @@ class GrokAltApp(App):
 
     def set_status(self, msg: str) -> None:
         self.query_one("#status-line", Static).update(msg)
-
-    def _sess_meta_markup(self) -> str:
-        return {"day": "dark_blue", "indigo": "cyan"}.get(self._ui_theme, "dim")
-
-    def _ov_key(self) -> str:
-        return {"day": "blue", "indigo": "magenta"}.get(self._ui_theme, "cyan")
-
-    def _prompt_label_markup(self, i: int, total: int, preview: str) -> str:
-        if self._ui_theme == "day":
-            return (
-                f"[bold dark_green]#{i + 1}[/bold dark_green]  "
-                f"[dim]{i + 1}/{total}[/dim]\n{preview}"
-            )
-        if self._ui_theme == "indigo":
-            return (
-                f"[bold green]#{i + 1}[/bold green]  "
-                f"[cyan]{i + 1}/{total}[/cyan]\n{preview}"
-            )
-        return (
-            f"[bold bright_green]#{i + 1}[/bold bright_green]  "
-            f"[dim]{i + 1}/{total}[/dim]\n{preview}"
-        )
 
 
     def action_help(self) -> None:
@@ -882,7 +1000,7 @@ class GrokAltApp(App):
                 item_id = f"si{gen}-{shown}"
                 lv.append(
                     ListItem(
-                        Label(f"[b]{self._escape(title)}[/b]\n[{self._sess_meta_markup()}]{self._escape(meta)}[/{self._sess_meta_markup()}]"),
+                        Label(f"[b]{self._escape(title)}[/b]\n[dim]{self._escape(meta)}[/dim]"),
                         id=item_id,
                     )
                 )
@@ -1134,38 +1252,21 @@ class GrokAltApp(App):
             log.write("[dim]No timeline events[/dim]")
             return
         cat_style = {
-            "turn": themes.rich_style("tl_turn"),
-            "tool": themes.rich_style("tl_tool"),
-            "user": themes.rich_style("tl_user"),
-            "agent": themes.rich_style("tl_agent"),
-            "phase": themes.rich_style("dim"),
-            "permission": themes.rich_style("tl_perm"),
-            "stream": themes.rich_style("tl_stream"),
-            "meta": themes.rich_style("tl_meta"),
-            "other": themes.rich_style("tl_other"),
+            "turn": "green",
+            "tool": "yellow",
+            "user": "bright_green",
+            "agent": "cyan",
+            "phase": "dim",
+            "permission": "red",
+            "stream": "magenta",
+            "meta": "blue",
+            "other": "white",
         }
         for it in items:
-            style = cat_style.get(it.get("category", "other"), themes.rich_style("tl_other"))
+            style = cat_style.get(it.get("category", "other"), "white")
             ts = core.fmt_time(it.get("ts"))
             title = self._escape(it.get("title") or "")
-            # Textual markup: style may include spaces — use style= form via Rich if needed; strip to simple tokens
-            st = style.replace(" ", "") if " " not in style or style.startswith("#") else style
-            # Prefer bracket styles that work in RichLog markup (simple names)
-            simple = {
-                "turn": "green", "tool": "yellow", "user": "bright_green", "agent": "cyan",
-                "phase": "dim", "permission": "red", "stream": "magenta", "meta": "blue", "other": "white",
-            }.get(it.get("category", "other"), "white")
-            if self._ui_theme == "day":
-                simple = {
-                    "turn": "green", "tool": "dark_orange3", "user": "green", "agent": "blue",
-                    "phase": "dim", "permission": "red", "stream": "magenta", "meta": "blue", "other": "black",
-                }.get(it.get("category", "other"), "black")
-            elif self._ui_theme == "indigo":
-                simple = {
-                    "turn": "green", "tool": "yellow", "user": "bright_green", "agent": "bright_magenta",
-                    "phase": "dim", "permission": "red", "stream": "magenta", "meta": "cyan", "other": "white",
-                }.get(it.get("category", "other"), "white")
-            log.write(f"[cyan]{ts}[/cyan] [{simple}]●[/{simple}] {title}")
+            log.write(f"[dim]{ts}[/dim] [{style}]●[/{style}] {title}")
             detail = it.get("detail")
             if detail:
                 lines = str(detail).splitlines() or [str(detail)]
@@ -1549,7 +1650,10 @@ class GrokAltApp(App):
             for i, text in enumerate(prompts):
                 preview = self._escape(self._prompt_preview(text))
                 # Show newest at bottom (natural order = turn order)
-                label = self._prompt_label_markup(i, total, preview)
+                label = (
+                    f"[bold bright_green]#{i + 1}[/bold bright_green]  "
+                    f"[dim]{i + 1}/{total}[/dim]\n{preview}"
+                )
                 lv.append(ListItem(Label(label), id=f"pn{gen}-{i}"))
             # Prefer selected prompt; else last (most recent)
             hi = prefer_idx if prefer_idx is not None else total - 1
@@ -1958,18 +2062,18 @@ class GrokAltApp(App):
         s = ov.get("summary") or {}
         sig = ov.get("signals") or {}
         info = s.get("info") or {}
-        ok = self._ov_key()
         log.write("[bold]Session overview[/bold]\n")
-        log.write(f"  [{ok}]title[/{ok}]  {self._escape(s.get('generated_title') or s.get('session_summary') or '—')}")
-        log.write(f"  [{ok}]id[/{ok}]     {info.get('id') or self.selected and self.selected.get('id')}")
-        log.write(f"  [{ok}]cwd[/{ok}]    {self._escape(info.get('cwd') or self.selected and self.selected.get('cwd') or '—')}")
-        log.write(f"  [{ok}]model[/{ok}]  {s.get('current_model_id') or '—'}")
-        log.write(f"  [{ok}]agent[/{ok}]  {s.get('agent_name') or '—'}")
-        log.write(f"  [{ok}]msgs[/{ok}]   {s.get('num_messages')} total · {s.get('num_chat_messages')} chat")
-        log.write(f"  [{ok}]tokens[/{ok}] {sig.get('total_tokens', '—')} · tools {sig.get('tool_calls', '—')}")
-        log.write(f"  [{ok}]created[/{ok}] {s.get('created_at') or '—'}")
-        log.write(f"  [{ok}]updated[/{ok}] {s.get('updated_at') or s.get('last_active_at') or '—'}")
-        log.write(f"  [{ok}]path[/{ok}]   {self._escape(ov.get('path') or '')}")
+        log.write(f"  [cyan]title[/cyan]  {self._escape(s.get('generated_title') or s.get('session_summary') or '—')}")
+        log.write(f"  [cyan]id[/cyan]     {info.get('id') or self.selected and self.selected.get('id')}")
+        log.write(f"  [cyan]cwd[/cyan]    {self._escape(info.get('cwd') or self.selected and self.selected.get('cwd') or '—')}")
+        log.write(f"  [cyan]model[/cyan]  {s.get('current_model_id') or '—'}")
+        log.write(f"  [cyan]agent[/cyan]  {s.get('agent_name') or '—'}")
+        log.write(f"  [cyan]msgs[/cyan]   {s.get('num_messages')} total · {s.get('num_chat_messages')} chat")
+        log.write(f"  [cyan]tokens[/cyan] {sig.get('total_tokens', '—')} · tools {sig.get('tool_calls', '—')}")
+        log.write(f"  [cyan]created[/cyan] {s.get('created_at') or '—'}")
+        log.write(f"  [cyan]updated[/cyan] {s.get('updated_at') or s.get('last_active_at') or '—'}")
+        log.write(f"  [cyan]path[/cyan]   {self._escape(ov.get('path') or '')}")
+
         log.write("\n[bold]Event types[/bold] (events.jsonl)")
         for k, v in list((ov.get("event_types") or {}).items())[:20]:
             log.write(f"  {k:28} {v}")
@@ -2010,8 +2114,7 @@ class GrokAltApp(App):
             extra = ""
             if isinstance(ctx, dict):
                 extra = " " + json.dumps(ctx, ensure_ascii=False)[:100]
-            mk = {"day": ("purple", "blue"), "indigo": ("magenta", "cyan")}.get(self._ui_theme, ("magenta", "cyan"))
-            log.write(f"[dim]{ts}[/dim] [{mk[0]}]{src}[/{mk[0]}] [{mk[1]}]{self._escape(msg)}[/{mk[1]}][dim]{self._escape(extra)}[/dim]")
+            log.write(f"[dim]{ts}[/dim] [magenta]{src}[/magenta] [cyan]{self._escape(msg)}[/cyan][dim]{self._escape(extra)}[/dim]")
         log.write(f"\n[dim]{len(entries)} log lines · filtered to this session[/dim]")
 
     # ── Launch real Grok ──────────────────────────────────────────
