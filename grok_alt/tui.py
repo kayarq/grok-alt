@@ -57,7 +57,7 @@ class HelpScreen(ModalScreen[None]):
   ↑/↓ then Enter  Jump chat view to that prompt + following reply
   Click a row     Same jump (no more scrolling the whole log)
   List scrolls    All turns are selectable (scroll with ↑/↓ or mouse)
-  d / D           Export selected turn → ~/grok-turn-exports (md + artifact files)
+  d / D           Export selected turn → ~/grok-turn-exports (full tools; blocked if turn still running)
 
 [b]Chat · tools (click to expand)[/b]
   Each tool is a clickable row (▸ title) — click to open/close details.
@@ -403,6 +403,57 @@ class GrokAltApp(App):
         self._prompt_nav_gen = 0
         self._populating_prompts = False
         self._pending_prompt_jump: int | None = None
+        self._last_prompt_nav_key: tuple | None = None  # skip ListView rebuild when unchanged
+
+    @staticmethod
+    def _safe_list_index(lv: ListView, index: int | None) -> None:
+        """Set ListView.index without crashing if children were rebuilt mid-event.
+
+        Textual raises ValueError: ListItem(id='pn…') is not in list when the
+        highlighted child was removed by a live refresh (left pane dies in tmux).
+        """
+        try:
+            if index is None:
+                try:
+                    lv.index = None  # type: ignore[assignment]
+                except Exception:
+                    pass
+                return
+            children = list(lv.children)
+            if not children:
+                return
+            idx = int(index)
+            if idx < 0 or idx >= len(children):
+                return
+            # Ensure target is still a direct child (stale widgets after clear)
+            target = children[idx]
+            if target not in lv.children:
+                return
+            lv.index = idx
+        except ValueError:
+            pass
+        except Exception:
+            pass
+
+    def _reset_list_view(self, lv: ListView) -> None:
+        """Drop all ListView children and clear highlight so no stale ListItem remains."""
+        try:
+            self._safe_list_index(lv, None)
+        except Exception:
+            pass
+        try:
+            lv.clear()
+        except Exception:
+            pass
+        for child in list(lv.children):
+            try:
+                child.remove()
+            except Exception:
+                pass
+        try:
+            self._safe_list_index(lv, None)
+        except Exception:
+            pass
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -791,6 +842,7 @@ class GrokAltApp(App):
             self._last_chat_fp = ""
             self._selected_prompt_index = None  # new session → re-resolve prompt for diffs
             self._diff_selected_path = None
+            self._last_prompt_nav_key = None  # force prompt ListView rebuild
 
     def action_show_tab(self, tab_id: str) -> None:
         tabs = self.query_one(TabbedContent)
@@ -840,16 +892,7 @@ class GrokAltApp(App):
         try:
             lv = self.query_one("#session-list", ListView)
             prev_sid = self.selected.get("id") if self.selected else None
-            # Remove children explicitly; clear() alone is not always enough under fast timers.
-            try:
-                lv.clear()
-            except Exception:
-                pass
-            for child in list(lv.children):
-                try:
-                    child.remove()
-                except Exception:
-                    pass
+            self._reset_list_view(lv)
             self._by_id.clear()
             self._list_gen += 1
             gen = self._list_gen
@@ -885,9 +928,7 @@ class GrokAltApp(App):
             elif highlight_index is not None:
                 try:
                     self._suppress_select_event = True
-                    lv.index = highlight_index
-                except Exception:
-                    pass
+                    self._safe_list_index(lv, highlight_index)
                 finally:
                     self._suppress_select_event = False
         except Exception as e:
@@ -925,9 +966,7 @@ class GrokAltApp(App):
             if isinstance(data, dict) and data.get("id") == target_sid:
                 try:
                     self._suppress_select_event = True
-                    lv.index = i
-                except Exception:
-                    pass
+                    self._safe_list_index(lv, i)
                 finally:
                     self._suppress_select_event = False
                 break
@@ -1162,7 +1201,11 @@ class GrokAltApp(App):
                 self._render_prompt_nav([])
                 return
 
-            msgs = core.build_chat_view(sess_dir)
+            msgs = core.build_chat_view(
+                sess_dir,
+                max_output_file_chars=core.TOOL_FULL_CHARS,
+                full_detail=True,
+            )
             if not msgs:
                 stream.mount(Static("[dim]No chat content[/dim]", classes="chat-block", markup=True))
                 self._render_prompt_nav([])
@@ -1386,21 +1429,46 @@ class GrokAltApp(App):
         """Fill the Chat-tab prompt index (all user turns, clickable)."""
         if self._populating_prompts:
             return
+        # Avoid thrashing ListView on every live chat rebuild when prompts unchanged
+        # (was a common cause of ValueError: ListItem(id='pn…') is not in list).
+        nav_key = (len(prompts), tuple(prompts))
+        prefer_idx = self._selected_prompt_index
+        if prefer_idx is None and prompts:
+            prefer_idx = len(prompts) - 1
+        if (
+            nav_key == self._last_prompt_nav_key
+            and prefer_idx is not None
+            and prompts
+        ):
+            # Only re-highlight / scroll; do not clear children
+            try:
+                lv = self.query_one("#prompt-nav", ListView)
+                self._suppress_select_event = True
+                self._safe_list_index(lv, prefer_idx)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self._suppress_select_event = False
+                except Exception:
+                    pass
+            try:
+                gen = self._prompt_nav_gen
+                self.call_after_refresh(
+                    lambda g=gen, i=prefer_idx: self._ensure_prompt_nav_visible(i, expect_gen=g)
+                )
+            except Exception:
+                pass
+            return
+
         self._populating_prompts = True
         try:
             lv = self.query_one("#prompt-nav", ListView)
-            try:
-                lv.clear()
-            except Exception:
-                pass
-            for child in list(lv.children):
-                try:
-                    child.remove()
-                except Exception:
-                    pass
+            self._reset_list_view(lv)
             self._prompt_nav_gen += 1
             gen = self._prompt_nav_gen
             total = len(prompts)
+            self._last_prompt_nav_key = nav_key
             if total == 0:
                 lv.append(
                     ListItem(
@@ -1417,32 +1485,44 @@ class GrokAltApp(App):
                     f"[dim]{i + 1}/{total}[/dim]\n{preview}"
                 )
                 lv.append(ListItem(Label(label), id=f"pn{gen}-{i}"))
-            # Default highlight last (most recent) prompt for quick access
+            # Prefer selected prompt; else last (most recent)
+            hi = prefer_idx if prefer_idx is not None else total - 1
+            if hi < 0:
+                hi = 0
+            if hi >= total:
+                hi = total - 1
             try:
                 self._suppress_select_event = True
-                lv.index = total - 1
-            except Exception:
-                pass
+                self._safe_list_index(lv, hi)
             finally:
                 self._suppress_select_event = False
             hdr = self.query_one("#prompt-nav-header", Static)
             hdr.update(
                 f"[b]Your prompts[/b]  [dim]· {total} turn(s) · "
-                f"↑/↓ scrolls full list · Enter jump · d = export → ~/grok-turn-exports[/dim]"
+                f"↑/↓ scrolls full list · Enter jump · d = export (after turn finishes)[/dim]"
             )
-            # Ensure highlight is in view (last items were clipped with height:auto)
+            # Defer scroll; ignore if another rebuild happened (gen mismatch)
             try:
-                self.call_after_refresh(lambda: self._ensure_prompt_nav_visible(total - 1))
+                self.call_after_refresh(
+                    lambda g=gen, i=hi: self._ensure_prompt_nav_visible(i, expect_gen=g)
+                )
             except Exception:
                 pass
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self.set_status(f"prompt list error: {type(e).__name__}")
+            except Exception:
+                pass
         finally:
             self._populating_prompts = False
 
-    def _ensure_prompt_nav_visible(self, index: int) -> None:
+    def _ensure_prompt_nav_visible(self, index: int, *, expect_gen: int | None = None) -> None:
         """Scroll prompt ListView so index is on-screen (fixes last-rows clipping)."""
         if index < 0:
+            return
+        if expect_gen is not None and expect_gen != self._prompt_nav_gen:
+            return  # list was rebuilt; old callback is stale
+        if self._populating_prompts:
             return
         try:
             lv = self.query_one("#prompt-nav", ListView)
@@ -1450,17 +1530,23 @@ class GrokAltApp(App):
             if index >= len(children):
                 return
             item = children[index]
+            if item not in lv.children:
+                return
             # Prefer ListView API when available
             scroll_to = getattr(lv, "scroll_to_widget", None)
             if callable(scroll_to):
-                scroll_to(item, animate=False, top=False)
+                try:
+                    scroll_to(item, animate=False, top=False)
+                except ValueError:
+                    pass
             else:
-                # Fallback: set index again after layout
                 self._suppress_select_event = True
                 try:
-                    lv.index = index
+                    self._safe_list_index(lv, index)
                 finally:
                     self._suppress_select_event = False
+        except ValueError:
+            pass
         except Exception:
             pass
 
@@ -1534,8 +1620,11 @@ class GrokAltApp(App):
             return
         # Scope Diffs tab to this user prompt/turn
         self._set_selected_prompt_index(idx)
-        # Keep highlight row fully in the prompt list viewport
-        self.call_after_refresh(lambda: self._ensure_prompt_nav_visible(idx))
+        # Keep highlight row fully in the prompt list viewport (gen-guarded)
+        gen = self._prompt_nav_gen
+        self.call_after_refresh(
+            lambda g=gen, i=idx: self._ensure_prompt_nav_visible(i, expect_gen=g)
+        )
         # Switch focus to chat body and scroll to the turn
         try:
             tabs = self.query_one(TabbedContent)
@@ -1643,15 +1732,7 @@ class GrokAltApp(App):
         self._populating_diff_list = True
         try:
             lv = self.query_one("#diff-file-list", ListView)
-            try:
-                lv.clear()
-            except Exception:
-                pass
-            for child in list(lv.children):
-                try:
-                    child.remove()
-                except Exception:
-                    pass
+            self._reset_list_view(lv)
             self._diff_by_id.clear()
             self._diff_list_gen += 1
             gen = self._diff_list_gen
@@ -1676,11 +1757,14 @@ class GrokAltApp(App):
                     sel_idx = i
             try:
                 self._suppress_select_event = True
-                lv.index = sel_idx
-            except Exception:
-                pass
+                self._safe_list_index(lv, sel_idx)
             finally:
                 self._suppress_select_event = False
+        except Exception as e:
+            try:
+                self.set_status(f"diff list error: {type(e).__name__}")
+            except Exception:
+                pass
         finally:
             self._populating_diff_list = False
 
@@ -1848,7 +1932,10 @@ class GrokAltApp(App):
 
 
     def action_export_turn(self) -> None:
-        """Save selected turn as markdown: ## Prompt / ## Trace / ## Response."""
+        """Save selected turn as markdown: ## Prompt / ## Trace / ## Response.
+
+        Blocks while the turn is still in progress (accuracy over partial exports).
+        """
         if not self.selected:
             self.set_status("Select a session first, then pick a prompt and press d")
             self.notify("No session selected", severity="warning")
@@ -1873,24 +1960,42 @@ class GrokAltApp(App):
             self.set_status("No prompt/turn to export — open Chat (2) and select a prompt")
             self.notify("Pick a prompt in Chat first", severity="warning")
             return
+        idx = int(idx)
+        turn_st = core.prompt_turn_status(sess_dir, idx)
+        if not turn_st.get("complete"):
+            msg = (
+                f"Turn #{idx + 1} is still in progress — export blocked until the agent "
+                f"finishes this turn (then wait ~{core.TURN_SETTLE_SECONDS:.0f}s and press d again)."
+            )
+            self.set_status(msg)
+            self.notify(
+                "Turn still running — wait for it to finish, then export",
+                severity="warning",
+            )
+            return
         try:
             path = core.export_turn_to_file(
                 sess_dir,
-                int(idx),
+                idx,
                 session_id=self.selected.get("id"),
+                require_complete=True,
             )
+        except core.TurnIncompleteError as e:
+            self.set_status(str(e))
+            self.notify("Turn still running — export blocked", severity="warning")
+            return
         except Exception as e:
             self.notify(f"Export failed: {e}", severity="error")
             self.set_status(f"export error: {type(e).__name__}: {e}")
             return
-        self._selected_prompt_index = int(idx)
+        self._selected_prompt_index = idx
         files_dir = path.parent / f"{path.stem}-files"
         extra = ""
         if files_dir.is_dir():
             n = sum(1 for _ in files_dir.iterdir() if _.is_file())
             if n:
                 extra = f" + {n} file(s) in {files_dir.name}/"
-        self.set_status(f"Exported turn #{int(idx) + 1} → {path}{extra}")
+        self.set_status(f"Exported turn #{idx + 1} → {path}{extra}")
         self.notify(f"Saved {path.name}{extra}")
 
 

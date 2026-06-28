@@ -2,7 +2,31 @@
 # grok-alt-tmux — side-by-side: trace TUI (left) + real Grok (right)
 set -euo pipefail
 
-ROOT="${GROK_ALT_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+_grok_alt_root() {
+  if [[ -n "${GROK_ALT_HOME:-}" ]]; then
+    cd "$GROK_ALT_HOME" && pwd
+    return
+  fi
+  local src="$1" dir
+  if command -v readlink >/dev/null 2>&1; then
+    local resolved
+    resolved="$(readlink -f "$src" 2>/dev/null || true)"
+    if [[ -n "$resolved" && -e "$resolved" ]]; then
+      src="$resolved"
+    else
+      while [[ -L "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src" || true)"
+        [[ "$src" != /* ]] && src="$dir/$src"
+      done
+      src="$(cd -P "$(dirname "$src")" && pwd)/$(basename "$src")"
+    fi
+  fi
+  cd "$(dirname "$src")/.." && pwd
+}
+
+ROOT="$(_grok_alt_root "$0")"
+export GROK_ALT_HOME="$ROOT"
 GROK_ALT="${GROK_ALT_BIN:-$ROOT/bin/grok-alt}"
 GROK_BIN="${GROK_BIN:-$HOME/.grok/bin/grok}"
 SESSION_NAME="${GROK_ALT_TMUX_SESSION:-grok-alt}"
@@ -16,6 +40,7 @@ fi
 
 if [[ ! -x "$GROK_ALT" ]]; then
   echo "grok-alt launcher not found/executable: $GROK_ALT" >&2
+  echo "  (GROK_ALT_HOME=$ROOT)" >&2
   exit 1
 fi
 
@@ -28,17 +53,33 @@ if [[ ! -x "$GROK_BIN" ]] && ! command -v "$GROK_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+_left_pane_alive() {
+  # Healthy trace pane runs the venv python (Textual) — not a dead shell after crash.
+  local dead cmd
+  dead="$(tmux display-message -p -t "$SESSION_NAME:main.0" '#{pane_dead}' 2>/dev/null || echo 1)"
+  [[ "$dead" == "1" ]] && return 1
+  cmd="$(tmux display-message -p -t "$SESSION_NAME:main.0" '#{pane_current_command}' 2>/dev/null || true)"
+  [[ "$cmd" == *python* || "$cmd" == *grok* ]]
+}
+
 if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
-  echo "Attaching to existing tmux session: $SESSION_NAME"
-  echo "  (kill it first with:  tmux kill-session -t $SESSION_NAME)"
-  exec tmux attach-session -t "=$SESSION_NAME"
+  if _left_pane_alive; then
+    echo "Attaching to existing tmux session: $SESSION_NAME"
+    echo "  (kill it first with:  tmux kill-session -t $SESSION_NAME)"
+    exec tmux attach-session -t "=$SESSION_NAME"
+  fi
+  echo "Existing session '$SESSION_NAME' has no live left (trace) pane — recreating…" >&2
+  tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true
 fi
 
+# remain-on-exit: if TUI still crashes, the left column stays with the error text
+# instead of collapsing so you only see Grok.
 tmux new-session -d -s "$SESSION_NAME" -n main -c "$PWD" \
   "$GROK_ALT" tui
 
 tmux set-option -t "$SESSION_NAME" exit-empty off 2>/dev/null || true
 tmux set-option -t "$SESSION_NAME" mouse on 2>/dev/null || true
+tmux set-window-option -t "$SESSION_NAME:main" remain-on-exit on 2>/dev/null || true
 tmux set-window-option -t "$SESSION_NAME:main" aggressive-resize off 2>/dev/null || true
 
 if ((${#GROK_ARGS[@]})); then
@@ -49,6 +90,15 @@ fi
 
 tmux resize-pane -t "$SESSION_NAME:main.0" -x 42%
 tmux select-pane -t "$SESSION_NAME:main.1"
+
+sleep 0.35
+if ! _left_pane_alive; then
+  echo "ERROR: left pane (grok-alt TUI) did not stay running." >&2
+  echo "  tried: $GROK_ALT tui" >&2
+  echo "  GROK_ALT_HOME=$ROOT" >&2
+  echo "  Debug:  (cd /tmp && $GROK_ALT tui)" >&2
+  echo "Attaching anyway so you can read any error in the left pane (remain-on-exit)." >&2
+fi
 
 tmux set-option -t "$SESSION_NAME" status-left "#[fg=cyan]grok-alt-tmux "
 tmux set-option -t "$SESSION_NAME" status-right "#[fg=yellow]drag border / mouse · Ctrl-b z zoom · d detach#[default]"

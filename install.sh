@@ -50,12 +50,23 @@ ln -sfn "$INSTALL_DIR/bin/grok-alt-tmux" "$BIN_DIR/grok-alt-tmux"
 
 echo
 echo "Verifying install …"
-if ! "$BIN_DIR/grok-alt" version >/dev/null; then
-  echo "ERROR: grok-alt failed to run after install." >&2
+# Must not depend on cwd (PATH symlink used to resolve ROOT to ~/.local and only
+# appeared to work when launched from the repo directory).
+if ! (cd /tmp && "$BIN_DIR/grok-alt" version >/dev/null); then
+  echo "ERROR: grok-alt failed to run after install (via $BIN_DIR, cwd=/tmp)." >&2
   exit 1
 fi
-VER=$("$BIN_DIR/grok-alt" version)
-echo "  $VER — OK"
+if ! (cd /tmp && "$INSTALL_DIR/.venv/bin/python3" -c "import textual, rich; import grok_alt.tui" ); then
+  echo "ERROR: TUI dependencies missing in $INSTALL_DIR/.venv (textual/rich/grok_alt.tui)." >&2
+  exit 1
+fi
+# Confirm the PATH entry resolves the package even with empty cwd on sys.path tricks:
+if ! (cd /tmp && "$BIN_DIR/grok-alt" list >/dev/null); then
+  echo "ERROR: grok-alt list failed (package/venv not found via symlink launcher)." >&2
+  exit 1
+fi
+VER=$(cd /tmp && "$BIN_DIR/grok-alt" version)
+echo "  $VER — OK (symlink launcher + TUI imports)"
 
 if ! command -v tmux >/dev/null 2>&1; then
   :

@@ -309,12 +309,20 @@ def summarize_update(update: dict, su: str) -> str:
 # ── Tool trace formatting (readable traces) ─────────────────────────
 
 # Display limits (env-overridable for power users)
+# Preview = legacy glance mode (rarely used). Full = UI expand + turn export (default).
 TOOL_PREVIEW_LINES = int(os.environ.get("GROK_ALT_TOOL_PREVIEW_LINES", "24"))
 TOOL_PREVIEW_CHARS = int(os.environ.get("GROK_ALT_TOOL_PREVIEW_CHARS", "3500"))
-# Export / turn markdown uses larger budgets so in-progress tools aren't truncated to a title.
-TOOL_EXPORT_LINES = int(os.environ.get("GROK_ALT_TOOL_EXPORT_LINES", "200"))
-TOOL_EXPORT_CHARS = int(os.environ.get("GROK_ALT_TOOL_EXPORT_CHARS", "50000"))
+# Full fidelity for collapsible tool bodies and exports (high ceiling; not chat "snippet" mode).
+TOOL_FULL_LINES = int(os.environ.get("GROK_ALT_TOOL_FULL_LINES", "500000"))
+TOOL_FULL_CHARS = int(os.environ.get("GROK_ALT_TOOL_FULL_CHARS", "2000000"))
+# Back-compat aliases (export path and older callers)
+TOOL_EXPORT_LINES = int(os.environ.get("GROK_ALT_TOOL_EXPORT_LINES", str(TOOL_FULL_LINES)))
+TOOL_EXPORT_CHARS = int(os.environ.get("GROK_ALT_TOOL_EXPORT_CHARS", str(TOOL_FULL_CHARS)))
 DIFF_CONTEXT_LINES = int(os.environ.get("GROK_ALT_DIFF_CONTEXT_LINES", "4"))
+# How many updates.jsonl lines to scan (0 = no limit)
+CHAT_VIEW_MAX_LINES = int(os.environ.get("GROK_ALT_CHAT_VIEW_MAX_LINES", "0"))
+# Brief pause after turn_completed before treating outputs as final (seconds; used by TUI/export)
+TURN_SETTLE_SECONDS = float(os.environ.get("GROK_ALT_TURN_SETTLE_SECONDS", "1.0"))
 
 # Map Grok tool titles → (kind, variant) when ACP omits kind on streaming updates
 _TITLE_KIND_HINTS: dict[str, tuple[str, str]] = {
@@ -637,7 +645,8 @@ def _unified_diff(old: str, new: str, path: str = "", context: int = DIFF_CONTEX
         # Fallback: show added/removed line counts only
         return f"~{len(old_lines)} lines → {len(new_lines)} lines (diff unavailable)"
     body = "\n".join(lines)
-    body, note = _truncate_text(body, max_lines=max(TOOL_PREVIEW_LINES, 40), max_chars=TOOL_PREVIEW_CHARS)
+    # Diffs used in full-detail tool blocks — keep high ceiling (preview callers rarely hit this alone)
+    body, note = _truncate_text(body, max_lines=TOOL_FULL_LINES, max_chars=TOOL_FULL_CHARS)
     if note:
         body += f"\n{note}"
     return body
@@ -735,11 +744,15 @@ def format_tool_block_from_update(
     phase: str = "result",
     sess_dir: Path | None = None,
     max_output_file_chars: int | None = None,
+    full_detail: bool = True,
 ) -> dict:
     """Turn a single tool_call / tool_call_update into a structured display block.
 
     Works for start, streaming in_progress, and completed — including Grok payloads
     where kind/title are missing on updates and stdout lives in output_for_prompt.
+
+    full_detail=True (default): high line/char budgets for UI expand + export accuracy.
+    full_detail=False: legacy short previews only.
     """
     ri_raw = update.get("rawInput") or update.get("input") or {}
     if not isinstance(ri_raw, dict):
@@ -751,7 +764,21 @@ def format_tool_block_from_update(
     title = update.get("title") or update.get("toolName") or ""
     status = update.get("status") or ""
     locations = update.get("locations") or []
-    file_cap = TOOL_PREVIEW_CHARS if max_output_file_chars is None else max_output_file_chars
+    if full_detail:
+        body_lines = TOOL_FULL_LINES
+        body_chars = TOOL_FULL_CHARS if max_output_file_chars is None else max_output_file_chars
+        file_cap = body_chars
+    else:
+        body_lines = TOOL_PREVIEW_LINES
+        body_chars = TOOL_PREVIEW_CHARS
+        file_cap = TOOL_PREVIEW_CHARS if max_output_file_chars is None else max_output_file_chars
+
+    def _cap(text: str, *, lines: int | None = None, chars: int | None = None) -> tuple[str, str]:
+        return _truncate_text(
+            text,
+            max_lines=body_lines if lines is None else lines,
+            max_chars=body_chars if chars is None else chars,
+        )
 
     # Infer missing ACP metadata from title / RO type / input keys
     kind = update.get("kind")  # read | search | edit | execute | think | other
@@ -932,7 +959,7 @@ def format_tool_block_from_update(
             if not raw:
                 raw = _content_blocks_text(update.get("content"))
             cleaned = _strip_line_numbers(_bytes_or_str(raw))
-            body, note = _truncate_text(cleaned)
+            body, note = _cap(cleaned)
             if body:
                 rpath = ri.get("target_file") or (locations[0] or {}).get("path") if locations else None
                 sections.append(
@@ -966,7 +993,7 @@ def format_tool_block_from_update(
                 meta.append(f"{len(files)} file(s)")
             if meta:
                 sections.append({"heading": "stats", "body": " · ".join(meta), "style": "meta"})
-            body, note = _truncate_text(stdout, max_lines=min(TOOL_PREVIEW_LINES, 40), max_chars=TOOL_PREVIEW_CHARS)
+            body, note = _cap(stdout)
             if body.strip():
                 sections.append(
                     {
@@ -1036,9 +1063,14 @@ def format_tool_block_from_update(
                 sess_dir=sess_dir,
                 tool_call_id=update.get("toolCallId"),
             )
-            if status == "in_progress":
+            # Prefer full terminal log over short "Background task started" stubs
+            if of_path is not None and (not out or len(out) < 200 or out.startswith("Background task")):
+                file_text = _read_text_file_capped(of_path, max_chars=file_cap)
+                if file_text is not None and file_text.strip() and len(file_text) > len(out or ""):
+                    out = file_text
+            if status == "in_progress" and not (out and len(out) > 200):
                 sections.append({"heading": "progress", "body": "running… (partial output below)", "style": "dim"})
-            if code is not None and status != "in_progress":
+            if code is not None and status == "completed":
                 sections.append({"heading": "exit", "body": str(code), "style": "meta" if code == 0 else "err"})
             elif code is not None and status == "in_progress":
                 # Grok sometimes pre-fills exit_code=0 while still streaming — show as tentative
@@ -1063,10 +1095,7 @@ def format_tool_block_from_update(
             if meta_bits:
                 sections.append({"heading": "stream", "body": " · ".join(meta_bits), "style": "meta"})
             if out:
-                # For exports use larger body budget via caller; chat keeps preview truncation
-                body, note = _truncate_text(out, max_lines=TOOL_PREVIEW_LINES, max_chars=min(file_cap, TOOL_PREVIEW_CHARS * 4) if file_cap > TOOL_PREVIEW_CHARS else TOOL_PREVIEW_CHARS)
-                if file_cap > TOOL_PREVIEW_CHARS:
-                    body, note = _truncate_text(out, max_lines=TOOL_EXPORT_LINES, max_chars=file_cap)
+                body, note = _cap(out)
                 sections.append(
                     {
                         "heading": "stdout" if status == "completed" else "stdout (live)",
@@ -1083,7 +1112,7 @@ def format_tool_block_from_update(
                     }
                 )
             if err and err.strip():
-                body, note = _truncate_text(err, max_lines=20)
+                body, note = _cap(err)
                 sections.append({"heading": "stderr", "body": body + (f"\n{note}" if note else ""), "style": "err"})
 
         elif ro_type == "ListDir":
@@ -1091,7 +1120,7 @@ def format_tool_block_from_update(
             listing = lc.get("content") or _content_blocks_text(update.get("content"))
             if not listing and isinstance(ro, dict):
                 listing = ro.get("output_for_prompt") or ""
-            body, note = _truncate_text(_bytes_or_str(listing), max_lines=60)
+            body, note = _cap(_bytes_or_str(listing))
             if body:
                 sections.append({"heading": "listing", "body": body + (f"\n{note}" if note else ""), "style": "code"})
 
@@ -1105,7 +1134,7 @@ def format_tool_block_from_update(
             if not extra and ro:
                 extra = json.dumps(ro, ensure_ascii=False, indent=2) if isinstance(ro, dict) else _bytes_or_str(ro)
             if extra and extra.strip() and extra.strip() not in ("{'type': 'text', 'text': ''}", "[]", "{}"):
-                body, note = _truncate_text(extra, max_lines=40, max_chars=8000)
+                body, note = _cap(extra)
                 if body.strip():
                     sections.append(
                         {
@@ -1152,18 +1181,43 @@ def format_tool_block_from_update(
     }
 
 
+def _ro_type(update: dict | None) -> str:
+    if not update or not isinstance(update, dict):
+        return ""
+    ro = update.get("rawOutput")
+    if isinstance(ro, dict):
+        return str(ro.get("type") or "")
+    return ""
+
+
+def _is_background_start_update(update: dict | None) -> bool:
+    """Grok marks background shell handoff as status=completed with this RO type — not final output."""
+    return _ro_type(update) == "BackgroundTaskStarted"
+
+
 def merge_tool_trace(
     start_update: dict | None,
     result_updates: list[dict],
     *,
     sess_dir: Path | None = None,
     max_output_file_chars: int | None = None,
+    full_detail: bool = True,
 ) -> dict:
-    """Merge tool_call + subsequent tool_call_update(s) into one readable block."""
-    # Prefer completed; else latest in_progress with the richest payload
+    """Merge tool_call + subsequent tool_call_update(s) into one readable block.
+
+    Does not treat BackgroundTaskStarted as a final result; prefers richest Bash /
+    terminal-log payload so long-running tools get one accurate block.
+    """
+    # Prefer real completed results; ignore "completed" background handoffs
     best = None
+    bg_start = None
     in_progress_list: list[dict] = []
     for u in result_updates:
+        if _is_background_start_update(u):
+            bg_start = u
+            # Still useful for output_file / command, but not as primary "done" status
+            in_progress_list.append(u)
+            continue
         if u.get("status") == "completed":
             best = u
         elif u.get("status") == "in_progress" or u.get("rawOutput") or u.get("content"):
@@ -1176,20 +1230,44 @@ def merge_tool_trace(
         ro = u.get("rawOutput")
         if isinstance(ro, dict):
             score += 10
-            for k in ("output_for_prompt", "output", "stdout", "FileContent", "stderr", "command"):
+            if ro.get("type") == "BackgroundTaskStarted":
+                score -= 50  # never win on richness alone
+            for k in ("output_for_prompt", "output", "stdout", "FileContent", "Content", "stderr", "command"):
                 v = ro.get(k)
                 if v not in (None, "", [], {}):
-                    score += 5 + min(len(_bytes_or_str(v)), 5000) // 200
+                    score += 5 + min(len(_bytes_or_str(v)), 50000) // 200
+            of = ro.get("output_file")
+            if of and sess_dir is not None:
+                path = _resolve_output_file_path(
+                    of if isinstance(of, str) else "",
+                    sess_dir=sess_dir,
+                    tool_call_id=u.get("toolCallId") if isinstance(u.get("toolCallId"), str) else None,
+                )
+                if path is not None:
+                    try:
+                        score += 20 + min(path.stat().st_size, 500_000) // 500
+                    except OSError:
+                        score += 5
         if u.get("content"):
             score += 3
         if u.get("rawInput"):
             score += 4
         if u.get("title"):
             score += 1
+        if u.get("status") == "completed" and not _is_background_start_update(u):
+            score += 15
         return score
 
     richest_ip = max(in_progress_list, key=_richness) if in_progress_list else None
-    primary = best or richest_ip or (result_updates[-1] if result_updates else {}) or {}
+    # Prefer true completed; else richest stream; never prefer bg-start alone if we have Bash chunks
+    if best is not None:
+        primary = best
+    elif richest_ip is not None:
+        primary = richest_ip
+    elif result_updates:
+        primary = result_updates[-1]
+    else:
+        primary = {}
     # Overlay start input onto primary for full context
     merged = dict(primary)
     if start_update:
@@ -1207,54 +1285,131 @@ def merge_tool_trace(
             merged["kind"] = start_update.get("kind")
         if start_update.get("locations") and not merged.get("locations"):
             merged["locations"] = start_update.get("locations")
-    # Carry best streaming fields from in_progress if completed is sparse
-    if richest_ip and richest_ip is not primary:
-        if not merged.get("kind") and richest_ip.get("kind"):
-            merged["kind"] = richest_ip.get("kind")
-        if not merged.get("rawInput") and richest_ip.get("rawInput"):
-            merged["rawInput"] = richest_ip.get("rawInput")
-        if not (merged.get("title") or "").strip() and richest_ip.get("title"):
-            merged["title"] = richest_ip.get("title")
-        if not merged.get("locations") and richest_ip.get("locations"):
-            merged["locations"] = richest_ip.get("locations")
-        # Prefer in_progress content when it has a real diff
-        if richest_ip.get("content"):
+        if start_update.get("toolCallId") and not merged.get("toolCallId"):
+            merged["toolCallId"] = start_update.get("toolCallId")
+
+    # Carry richest streaming / bg-start fields when primary is sparse or is still bg-start
+    donors = [u for u in (richest_ip, bg_start) if u and u is not primary]
+    for donor in donors:
+        if not merged.get("kind") and donor.get("kind"):
+            merged["kind"] = donor.get("kind")
+        if not merged.get("rawInput") and donor.get("rawInput"):
+            merged["rawInput"] = donor.get("rawInput")
+        if not (merged.get("title") or "").strip() and donor.get("title"):
+            merged["title"] = donor.get("title")
+        if not merged.get("locations") and donor.get("locations"):
+            merged["locations"] = donor.get("locations")
+        if donor.get("content"):
             if not any(
                 isinstance(b, dict) and b.get("type") == "diff" for b in (merged.get("content") or [])
             ):
                 if any(
-                    isinstance(b, dict) and b.get("type") == "diff" for b in (richest_ip.get("content") or [])
+                    isinstance(b, dict) and b.get("type") == "diff" for b in (donor.get("content") or [])
                 ):
-                    merged["content"] = richest_ip.get("content")
-        # If completed has empty RO but IP has output_for_prompt, prefer IP RO for display
+                    merged["content"] = donor.get("content")
         mro = merged.get("rawOutput") if isinstance(merged.get("rawOutput"), dict) else {}
-        ipro = richest_ip.get("rawOutput") if isinstance(richest_ip.get("rawOutput"), dict) else {}
-        if ipro and (
+        dro = donor.get("rawOutput") if isinstance(donor.get("rawOutput"), dict) else {}
+        if not dro:
+            continue
+        # Prefer Bash (or any non-BackgroundTaskStarted) RO over handoff-only RO
+        if _ro_type(merged) == "BackgroundTaskStarted" and dro.get("type") not in (
+            None,
+            "",
+            "BackgroundTaskStarted",
+        ):
+            combo = dict(mro)
+            combo.update(dro)
+            merged["rawOutput"] = combo
+            continue
+        if dro and (
             not mro
+            or _ro_type(merged) == "BackgroundTaskStarted"
             or (
-                not _bytes_or_str(mro.get("output_for_prompt") or mro.get("output"))
-                and _bytes_or_str(ipro.get("output_for_prompt") or ipro.get("output"))
+                not _bytes_or_str(mro.get("output_for_prompt") or mro.get("output") or mro.get("stdout"))
+                and _bytes_or_str(dro.get("output_for_prompt") or dro.get("output") or dro.get("stdout"))
             )
         ):
-            # Merge RO dicts — prefer non-empty fields from either
-            combo = dict(ipro)
+            combo = dict(dro)
             combo.update({k: v for k, v in mro.items() if v not in (None, "", [], {})})
-            # Prefer longer prompt output
-            a = _bytes_or_str(mro.get("output_for_prompt"))
-            b = _bytes_or_str(ipro.get("output_for_prompt"))
+            a = _bytes_or_str(mro.get("output_for_prompt") or mro.get("output") or mro.get("stdout"))
+            b = _bytes_or_str(dro.get("output_for_prompt") or dro.get("output") or dro.get("stdout"))
             if len(b) > len(a):
-                combo["output_for_prompt"] = ipro.get("output_for_prompt")
+                for k in ("output_for_prompt", "output", "stdout"):
+                    if dro.get(k) not in (None, "", [], {}):
+                        combo[k] = dro.get(k)
+                        break
+            # Preserve output_file from bg start if missing
+            if not combo.get("output_file") and mro.get("output_file"):
+                combo["output_file"] = mro.get("output_file")
+            if not combo.get("output_file") and dro.get("output_file"):
+                combo["output_file"] = dro.get("output_file")
             merged["rawOutput"] = combo
+
+    # Promote to Bash for formatting when we have shell signals but RO type is still handoff
+    mro = merged.get("rawOutput") if isinstance(merged.get("rawOutput"), dict) else {}
+    if mro.get("type") == "BackgroundTaskStarted" or (
+        not mro.get("type")
+        and (
+            mro.get("output_file")
+            or (start_update or {}).get("title") in ("run_terminal_command", "bash", "shell")
+            or ((start_update or {}).get("rawInput") or {}).get("command")
+        )
+    ):
+        mro = dict(mro)
+        if mro.get("type") == "BackgroundTaskStarted":
+            # Keep output_file; present as Bash so stdout path + log read runs
+            mro["type"] = "Bash"
+            if not merged.get("kind"):
+                merged["kind"] = "execute"
+        elif not mro.get("type") and (
+            mro.get("output_file") or ((start_update or {}).get("rawInput") or {}).get("command")
+        ):
+            mro["type"] = "Bash"
+            if not merged.get("kind"):
+                merged["kind"] = "execute"
+        merged["rawOutput"] = mro
+
+    # Terminal log size (for status): if we have real log bytes, treat as completed once
+    # the turn assembler flushes (we only merge at turn boundaries now).
+    log_bytes = 0
+    tid_for_log = merged.get("toolCallId") or (start_update or {}).get("toolCallId")
+    of_raw = mro.get("output_file") if isinstance(mro, dict) else None
+    if sess_dir is not None:
+        log_path = _resolve_output_file_path(
+            of_raw if isinstance(of_raw, str) else "",
+            sess_dir=sess_dir,
+            tool_call_id=tid_for_log if isinstance(tid_for_log, str) else None,
+        )
+        if log_path is not None:
+            try:
+                log_bytes = log_path.stat().st_size
+            except OSError:
+                log_bytes = 0
+
+    # Status: true completed wins; else if we have a non-trivial terminal log, seal as completed
+    # (background tools often never emit a second completed). Else keep stream status.
+    if best is not None:
+        merged["status"] = "completed"
+    elif log_bytes > 64:
+        merged["status"] = "completed"
+    elif best is None and bg_start is not None and richest_ip is bg_start and log_bytes <= 64:
+        merged["status"] = "in_progress"
+    elif richest_ip is not None and not merged.get("status"):
+        merged["status"] = richest_ip.get("status") or "in_progress"
+
     # Only start exists (tool just kicked off)
     if not result_updates and start_update:
         merged = dict(start_update)
         if not merged.get("status"):
             merged["status"] = "in_progress"
+
+    file_cap = TOOL_FULL_CHARS if max_output_file_chars is None else max_output_file_chars
     block = format_tool_block_from_update(
         merged,
         phase="merged",
         sess_dir=sess_dir,
-        max_output_file_chars=max_output_file_chars,
+        max_output_file_chars=file_cap,
+        full_detail=full_detail,
     )
     block["kind_phase"] = "trace"
     return block
@@ -1325,15 +1480,25 @@ def build_timeline(sess_dir: Path, limit: int = 5000, hide_phases: bool = True) 
 
 def build_chat_view(
     sess_dir: Path,
-    limit: int = 2000,
+    limit: int | None = None,
     *,
     max_output_file_chars: int | None = None,
+    full_detail: bool = True,
 ) -> list[dict]:
     """Build readable chat + tool traces from updates.jsonl.
 
-    Tool calls are merged by toolCallId so you see one block per tool
-    (request + result), with formatted diffs / file contents / grep hits.
+    Tool calls are merged by toolCallId into **one block per tool**, finalized only
+    when the turn completes (turn_completed), the next user prompt starts, or the
+    stream ends — never on the first status=completed (background handoffs).
+
+    full_detail=True keeps full tool bodies for UI expand and exports.
     """
+    if limit is None:
+        limit = CHAT_VIEW_MAX_LINES if CHAT_VIEW_MAX_LINES > 0 else None
+    # iter_jsonl: None max_lines = no limit
+    max_lines = limit if limit and limit > 0 else None
+    file_cap = TOOL_FULL_CHARS if max_output_file_chars is None else max_output_file_chars
+
     messages: list[dict] = []
     buf_user: list[str] = []
     buf_agent: list[str] = []
@@ -1363,7 +1528,8 @@ def build_chat_view(
             slot.get("start"),
             slot.get("updates") or [],
             sess_dir=sess_dir,
-            max_output_file_chars=max_output_file_chars,
+            max_output_file_chars=file_cap,
+            full_detail=full_detail,
         )
         messages.append(block)
 
@@ -1373,17 +1539,18 @@ def build_chat_view(
         open_tools.clear()
         tool_order.clear()
 
-    for up in iter_jsonl(sess_dir / "updates.jsonl", max_lines=limit):
+    for up in iter_jsonl(sess_dir / "updates.jsonl", max_lines=max_lines):
         if up.get("_parse_error"):
             continue
         update = ((up.get("params") or {}).get("update")) or {}
         su = update.get("sessionUpdate")
         if su == "user_message_chunk":
+            # Next user turn: seal prior tools with everything collected so far
             flush_all_tools()
             flush_agent()
             buf_user.append(((update.get("content") or {}).get("text")) or "")
         elif su == "agent_message_chunk":
-            flush_all_tools()
+            # Keep tools open across agent text within the same turn (accuracy > live partials)
             flush_user()
             buf_agent.append(((update.get("content") or {}).get("text")) or "")
         elif su == "tool_call":
@@ -1394,22 +1561,28 @@ def build_chat_view(
                 open_tools[tid] = {"start": update, "updates": []}
                 tool_order.append(tid)
             else:
+                # Same id again: keep accumulating (do not emit a second block)
                 open_tools[tid]["start"] = update
         elif su == "tool_call_update":
             tid = update.get("toolCallId") or (tool_order[-1] if tool_order else None)
             if not tid:
-                # Orphan result — format standalone
                 flush_user()
                 flush_agent()
-                messages.append(format_tool_block_from_update(update, phase="result"))
+                messages.append(
+                    format_tool_block_from_update(
+                        update,
+                        phase="result",
+                        sess_dir=sess_dir,
+                        max_output_file_chars=file_cap,
+                        full_detail=full_detail,
+                    )
+                )
                 continue
             if tid not in open_tools:
                 open_tools[tid] = {"start": None, "updates": []}
                 tool_order.append(tid)
             open_tools[tid]["updates"].append(update)
-            # Emit as soon as we have a completed result (keeps chat streaming-friendly)
-            if update.get("status") == "completed":
-                flush_tool(tid)
+            # Do NOT flush on status=completed — wait for turn_completed / next user / EOF
         elif su == "turn_completed":
             flush_all_tools()
             flush_user()
@@ -1423,7 +1596,7 @@ def build_chat_view(
     if messages:
         return messages
 
-    for row in iter_jsonl(sess_dir / "chat_history.jsonl", max_lines=limit):
+    for row in iter_jsonl(sess_dir / "chat_history.jsonl", max_lines=max_lines):
         if row.get("_parse_error"):
             continue
         role = row.get("type") or row.get("role") or "unknown"
@@ -1440,6 +1613,103 @@ def build_chat_view(
             content = json.dumps(content, ensure_ascii=False) if content is not None else ""
         messages.append({"role": role, "text": content})
     return messages
+
+
+def prompt_turn_status(sess_dir: Path, prompt_index: int, *, limit: int | None = None) -> dict:
+    """Whether a user prompt/turn has finished in updates.jsonl.
+
+    A turn is complete when we have seen ``turn_completed`` after that prompt and
+    before the next user prompt, **or** a later user prompt has started (prior turn
+    was sealed). The latest turn is incomplete until ``turn_completed`` (or EOF with
+    no open tools — still treated incomplete if tools were in flight without turn_completed).
+
+    Returns dict: complete (bool), reason (str), saw_turn_completed (bool), has_later_user (bool).
+    """
+    if limit is None:
+        limit = CHAT_VIEW_MAX_LINES if CHAT_VIEW_MAX_LINES > 0 else None
+    max_lines = limit if limit and limit > 0 else None
+
+    current_prompt = -1
+    in_user_chunk = False
+    saw_turn_completed_for_target = False
+    has_later_user = False
+    open_tools_after_target = False
+    tool_ids_open: set[str] = set()
+
+    for up in iter_jsonl(sess_dir / "updates.jsonl", max_lines=max_lines):
+        if up.get("_parse_error"):
+            continue
+        update = ((up.get("params") or {}).get("update")) or {}
+        su = update.get("sessionUpdate")
+        if su == "user_message_chunk":
+            if not in_user_chunk:
+                current_prompt += 1
+                in_user_chunk = True
+                if current_prompt > prompt_index:
+                    has_later_user = True
+                    break
+            continue
+        if su:
+            in_user_chunk = False
+        if current_prompt < prompt_index:
+            continue
+        if current_prompt > prompt_index:
+            has_later_user = True
+            break
+        # current_prompt == prompt_index
+        if su == "tool_call":
+            tid = update.get("toolCallId")
+            if tid:
+                tool_ids_open.add(tid)
+        elif su == "tool_call_update":
+            tid = update.get("toolCallId")
+            if tid:
+                tool_ids_open.add(tid)
+            # BackgroundTaskStarted is not "tools done"
+            if (
+                update.get("status") == "completed"
+                and not _is_background_start_update(update)
+                and tid
+            ):
+                pass  # still wait for turn_completed for accuracy
+        elif su == "turn_completed":
+            saw_turn_completed_for_target = True
+            tool_ids_open.clear()
+
+    if has_later_user:
+        return {
+            "complete": True,
+            "reason": "later_user_prompt",
+            "saw_turn_completed": saw_turn_completed_for_target,
+            "has_later_user": True,
+        }
+    if saw_turn_completed_for_target:
+        return {
+            "complete": True,
+            "reason": "turn_completed",
+            "saw_turn_completed": True,
+            "has_later_user": False,
+        }
+    open_tools_after_target = bool(tool_ids_open)
+    return {
+        "complete": False,
+        "reason": "turn_in_progress" if (current_prompt >= prompt_index) else "prompt_not_found",
+        "saw_turn_completed": False,
+        "has_later_user": False,
+        "open_tool_ids": len(tool_ids_open),
+    }
+
+
+class TurnIncompleteError(RuntimeError):
+    """Raised when exporting a turn that has not finished yet."""
+
+    def __init__(self, prompt_index: int, status: dict):
+        self.prompt_index = prompt_index
+        self.status = status
+        super().__init__(
+            f"Turn {prompt_index + 1} is still in progress "
+            f"({status.get('reason', 'unknown')}). Wait until the agent finishes, then export."
+        )
 
 
 def session_overview(sess_dir: Path) -> dict:
@@ -1874,14 +2144,31 @@ def collect_turn_artifacts(sess_dir: Path, tools: list[dict]) -> list[dict]:
     return artifacts
 
 
-def build_turn_bundle(sess_dir: Path, prompt_index: int, *, limit: int = 5000) -> dict:
+def build_turn_bundle(
+    sess_dir: Path,
+    prompt_index: int,
+    *,
+    limit: int | None = None,
+    require_complete: bool = False,
+) -> dict:
     """One user turn as Prompt + Trace (tools/events) + Response + artifacts.
 
     prompt_index is 0-based and matches build_chat_view user messages and
     build_session_file_changes(prompt_index=…).
+
+    If require_complete is True and the turn has not finished, raises TurnIncompleteError.
     """
-    # Use export budgets when reading terminal logs so large shell outputs are included
-    msgs = build_chat_view(sess_dir, limit=limit, max_output_file_chars=TOOL_EXPORT_CHARS)
+    status = prompt_turn_status(sess_dir, prompt_index, limit=limit)
+    if require_complete and not status.get("complete"):
+        raise TurnIncompleteError(prompt_index, status)
+
+    # Full fidelity: no line-scan default cap; full tool bodies
+    msgs = build_chat_view(
+        sess_dir,
+        limit=limit,
+        max_output_file_chars=TOOL_FULL_CHARS,
+        full_detail=True,
+    )
     prompt_text = ""
     response_parts: list[str] = []
     tools: list[dict] = []
@@ -1909,7 +2196,8 @@ def build_turn_bundle(sess_dir: Path, prompt_index: int, *, limit: int = 5000) -
             tools.append(m)
 
     timeline_lines: list[str] = []
-    for ev in iter_jsonl(sess_dir / "events.jsonl", max_lines=limit):
+    ev_limit = limit if limit and limit > 0 else None
+    for ev in iter_jsonl(sess_dir / "events.jsonl", max_lines=ev_limit):
         if ev.get("_parse_error"):
             continue
         tn = ev.get("turn_number")
@@ -1926,24 +2214,24 @@ def build_turn_bundle(sess_dir: Path, prompt_index: int, *, limit: int = 5000) -
     trace_sections: list[str] = []
     for i, block in enumerate(tools, 1):
         label = block.get("label") or block.get("tool_name") or block.get("title") or "tool"
-        status = block.get("status") or ""
+        tool_status = block.get("status") or ""
         summary = block.get("summary") or block.get("title") or ""
         head = f"### Tool {i}: {label}"
-        if status:
-            head += f" [{status}]"
+        if tool_status:
+            head += f" [{tool_status}]"
         lines = [head]
         if summary and summary != label:
             lines.append(summary)
         sections = list(block.get("sections") or [])
         if len(sections) <= 1 and block.get("raw_input"):
-            dump = _generic_input_dump(block["raw_input"], max_chars=TOOL_EXPORT_CHARS)
+            dump = _generic_input_dump(block["raw_input"], max_chars=TOOL_FULL_CHARS)
             if dump and not any(s.get("heading") == "input" for s in sections):
                 sections.append({"heading": "input (full)", "body": dump, "style": "code"})
         for sec in sections:
             h = sec.get("heading") or sec.get("style") or "section"
             body = sec.get("body") or ""
-            if body and len(body) > TOOL_EXPORT_CHARS:
-                body = body[:TOOL_EXPORT_CHARS] + f"\n… truncated at {TOOL_EXPORT_CHARS} chars"
+            if body and len(body) > TOOL_FULL_CHARS:
+                body = body[:TOOL_FULL_CHARS] + f"\n… truncated at {TOOL_FULL_CHARS} chars"
             lines.append(f"\n#### {h}")
             if body:
                 style = sec.get("style") or ""
@@ -1960,16 +2248,17 @@ def build_turn_bundle(sess_dir: Path, prompt_index: int, *, limit: int = 5000) -
                 content = json.dumps(content, ensure_ascii=False, indent=2)
             lines.append("\n#### content")
             lines.append("```")
-            lines.append(content if len(content) < TOOL_EXPORT_CHARS else content[:TOOL_EXPORT_CHARS] + "\n…")
+            lines.append(content if len(content) < TOOL_FULL_CHARS else content[:TOOL_FULL_CHARS] + "\n…")
             lines.append("```")
-        if status == "in_progress" and len(lines) <= 2:
+        if tool_status == "in_progress" and len(lines) <= 2:
             lines.append("\n_(tool still running — partial args/output above if available)_")
         trace_sections.append("\n".join(lines))
 
     if timeline_lines:
         trace_sections.append("### Timeline events\n" + "\n".join(timeline_lines))
 
-    file_changes = build_session_file_changes(sess_dir, prompt_index=prompt_index, limit=limit)
+    fc_limit = limit if limit and limit > 0 else 50000
+    file_changes = build_session_file_changes(sess_dir, prompt_index=prompt_index, limit=fc_limit)
     if file_changes.get("files"):
         fc_lines = ["### File changes this turn"]
         for f in file_changes["files"]:
@@ -2018,6 +2307,7 @@ def build_turn_bundle(sess_dir: Path, prompt_index: int, *, limit: int = 5000) -
         "file_changes": file_changes,
         "artifacts": artifacts,
         "markdown": markdown,
+        "turn_status": status,
     }
 
 
@@ -2033,6 +2323,8 @@ def export_turn_to_file(
     *,
     session_id: str | None = None,
     copy_artifacts: bool = True,
+    require_complete: bool = True,
+    settle_seconds: float | None = None,
 ) -> Path:
     """Write turn bundle under ~/grok-turn-exports (or GROK_ALT_TURN_EXPORT_DIR).
 
@@ -2041,9 +2333,21 @@ def export_turn_to_file(
         ~/grok-turn-exports/turn-<sid8>-<nnn>.md
         ~/grok-turn-exports/turn-<sid8>-<nnn>-files/<artifacts>
 
+    By default refuses in-progress turns (require_complete=True). Optional settle
+    delay waits for late log flushes after turn_completed.
+
     Returns the markdown path.
     """
-    bundle = build_turn_bundle(sess_dir, prompt_index)
+    import time
+
+    st = prompt_turn_status(sess_dir, prompt_index)
+    if require_complete and not st.get("complete"):
+        raise TurnIncompleteError(prompt_index, st)
+    wait = TURN_SETTLE_SECONDS if settle_seconds is None else settle_seconds
+    if wait > 0 and st.get("complete") and st.get("reason") == "turn_completed":
+        time.sleep(wait)
+
+    bundle = build_turn_bundle(sess_dir, prompt_index, require_complete=require_complete)
     sid = session_id or sess_dir.name
     stem = f"turn-{sid[:8]}-{prompt_index + 1:03d}"
     if dest is None:
