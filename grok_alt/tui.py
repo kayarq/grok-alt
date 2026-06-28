@@ -32,6 +32,7 @@ from textual.widgets import (
 
 from . import core
 from . import pretty
+from . import themes
 
 # Live-follow poll interval (seconds). Slightly gentler default — full chat remounts are expensive.
 LIVE_POLL_INTERVAL = float(os.environ.get("GROK_ALT_POLL_INTERVAL", "1.5"))
@@ -82,6 +83,7 @@ class HelpScreen(ModalScreen[None]):
   [ / ]          Move tool focus in chat
   f              Toggle live auto-follow (on by default)
   q / Ctrl+C     Quit (in tmux: ends whole grok-alt session → back to shell)
+  m              Cycle theme: Night → Day → Indigo/forest (saved under ~/.config/grok-alt/)
 
 [dim]Live mode polls session files so traces update while you chat.
 Select a prompt to scroll there and expand that turn's tools. Official Grok: g / c / R.[/dim]
@@ -102,241 +104,14 @@ class GrokAltApp(App):
 
     TITLE = "grok-alt"
     SUB_TITLE = "trace TUI · companion to Grok"
-    CSS = """
-    Screen { background: #0d1117; width: 100%; height: 100%; }
-
-    /* Sidebar shrinks on narrow tmux panes so main content stays usable */
-    #sidebar {
-        width: 30%;
-        min-width: 18;
-        max-width: 36;
-        background: #161b22;
-        border-right: solid #30363d;
-    }
-
-    #main {
-        width: 1fr;
-        min-width: 20;
-        overflow-x: auto;
-    }
-
-    #session-filter {
-        margin: 0 1;
-        dock: top;
-    }
-
-    #session-list {
-        height: 1fr;
-    }
-
-    ListView { background: #161b22; }
-    ListItem { padding: 0 1; }
-    ListItem.--highlight { background: #1c2d41; }
-
-    .sess-title { color: #e6edf3; }
-    .sess-meta { color: #8b949e; text-style: dim; }
-
-    #status-line {
-        dock: bottom;
-        height: 1;
-        background: #161b22;
-        color: #8b949e;
-        padding: 0 1;
-    }
-
-    TabbedContent { height: 1fr; width: 100%; }
-    TabPane { width: 100%; height: 1fr; }
-
-    /* Prevent horizontal run-off in narrow panes (tmux left column) */
-    RichLog {
-        background: #0d1117;
-        color: #e6edf3;
-        height: 1fr;
-        width: 100%;
-        min-width: 1;
-        border: none;
-        scrollbar-background: #161b22;
-        scrollbar-color: #30363d;
-        overflow-x: auto;
-    }
-
-    /* Chat tab: prompt index (top) + full conversation (bottom)
-       Fixed height + 1fr ListView so ALL prompts are scrollable/selectable.
-       height:auto + max-height was clipping the last 1–2 rows (tmux bug). */
-    #chat-pane { height: 1fr; width: 100%; }
-    #prompt-nav-wrap {
-        height: 14;
-        min-height: 8;
-        max-height: 18;
-        width: 100%;
-        background: #161b22;
-        border-bottom: solid #30363d;
-        layout: vertical;
-    }
-    #prompt-nav-header {
-        height: 1;
-        padding: 0 1;
-        color: #8b949e;
-        background: #21262d;
-        dock: top;
-    }
-
-    #prompt-nav {
-        height: 1fr;
-        min-height: 6;
-        background: #161b22;
-        overflow-y: auto;
-        scrollbar-background: #161b22;
-        scrollbar-color: #30363d;
-    }
-    #prompt-nav ListItem { padding: 0 1; height: 2; }
-    #prompt-nav ListItem.--highlight { background: #238636; }
-
-    #chat-toolbar {
-        height: auto;
-        min-height: 3;
-        max-height: 5;
-        width: 100%;
-        padding: 0 1;
-        background: #21262d;
-        border-bottom: solid #30363d;
-        overflow-x: auto;
-    }
-    #chat-toolbar Button {
-        margin: 0 1 0 0;
-        min-width: 12;
-        max-width: 22;
-    }
-    #chat-toolbar-hint {
-        color: #8b949e;
-        padding: 0 1;
-        width: 1fr;
-        min-width: 0;
-    }
-    #chat-stream {
-        height: 1fr;
-        width: 100%;
-        min-width: 1;
-        background: #0d1117;
-        padding: 0 1 1 1;
-        scrollbar-background: #161b22;
-        scrollbar-color: #30363d;
-        overflow-x: hidden;
-        overflow-y: auto;
-    }
-    #chat-stream .chat-block {
-        width: 100%;
-        max-width: 100%;
-        margin: 0 0 1 0;
-        padding: 0 1;
-    }
-    #chat-stream .chat-user {
-        width: 100%;
-        background: #12261e;
-        border-left: solid #3fb950;
-        padding: 0 1;
-        margin-bottom: 1;
-    }
-    #chat-stream .chat-agent {
-        width: 100%;
-        background: #0d1b2a;
-        border-left: solid #58a6ff;
-        padding: 0 1;
-        margin-bottom: 1;
-    }
-    #chat-stream .chat-system {
-        width: 100%;
-        color: #8b949e;
-        margin: 0 0 1 0;
-    }
-    #chat-stream Collapsible {
-        width: 100%;
-        max-width: 100%;
-        margin: 0 0 1 0;
-        background: #161b22;
-        border-left: solid #d29922;
-        padding: 0;
-    }
-    #chat-stream CollapsibleTitle {
-        width: 100%;
-        max-width: 100%;
-        background: #21262d;
-        color: #e6edf3;
-        overflow: hidden;
-    }
-    #chat-stream CollapsibleTitle:hover {
-        background: #30363d;
-        color: #f0e68c;
-    }
-    #chat-stream .tool-body {
-        width: 100%;
-        max-width: 100%;
-        padding: 0 1 1 2;
-        background: #0d1117;
-    }
-    #chat-stream .chat-footer {
-        width: 100%;
-        color: #8b949e;
-        margin-top: 1;
-    }
-
-    /* Diffs tab: file list + per-file changes */
-    #diffs-pane { height: 1fr; width: 100%; }
-    #diff-files-wrap {
-        width: 32%;
-        min-width: 16;
-        max-width: 42;
-        background: #161b22;
-        border-right: solid #30363d;
-    }
-    #diff-files-header {
-        height: 1;
-        padding: 0 1;
-        color: #8b949e;
-        background: #21262d;
-    }
-    #diff-file-list { height: 1fr; background: #161b22; }
-    #diff-file-list ListItem { padding: 0 1; height: 3; }
-    #diff-file-list ListItem.--highlight { background: #1f3d2a; }
-    #diff-detail-wrap {
-        width: 1fr;
-        min-width: 20;
-        background: #0d1117;
-    }
-    #diff-detail-header {
-        height: auto;
-        min-height: 2;
-        max-height: 4;
-        padding: 0 1;
-        color: #e6edf3;
-        background: #21262d;
-        border-bottom: solid #30363d;
-    }
-    #diff-detail-scroll {
-        height: 1fr;
-        width: 100%;
-        padding: 0 1 1 1;
-        background: #0d1117;
-    }
-    #diff-detail-body { width: 100%; }
-
-    #help-dialog {
-        width: 72;
-        height: auto;
-        max-height: 90%;
-        background: #161b22;
-        border: solid #58a6ff;
-        padding: 1 2;
-    }
-    #help-title { color: #58a6ff; margin-bottom: 1; }
-    #help-body { color: #e6edf3; }
-    """
+    CSS = themes.APP_CSS
 
     # priority=True: work even when focus is on ListView / Input / RichLog (tmux UX)
     BINDINGS = [
         Binding("q", "quit_app", "Quit", priority=True),
         Binding("ctrl+c", "quit_app", "Quit", show=False, priority=True),
         Binding("question_mark", "help", "Help", priority=True),
+        Binding("m", "cycle_theme", "Theme", priority=True),
         Binding("r", "refresh", "Refresh", priority=True),
         Binding("f", "toggle_live", "Live", priority=True),
         Binding("g", "launch_grok", "Grok", priority=True),
@@ -407,6 +182,7 @@ class GrokAltApp(App):
         self._populating_prompts = False
         self._pending_prompt_jump: int | None = None
         self._last_prompt_nav_key: tuple | None = None  # skip ListView rebuild when unchanged
+        self._ui_theme: str = themes.load_theme()
 
     @staticmethod
     def _safe_list_index(lv: ListView, index: int | None) -> None:
@@ -530,12 +306,39 @@ class GrokAltApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._apply_theme(self._ui_theme, persist=False, notify=False)
         self.refresh_sessions(auto_select=True)
         self._start_live_poll()
+        label = themes.THEME_LABELS.get(self._ui_theme, self._ui_theme)
         self.set_status(
-            f"GROK_HOME={core.GROK_HOME} · sessions={'ok' if core.SESSIONS_DIR.exists() else 'missing'} · "
-            f"live={'on' if self.live_follow else 'off'} · ? help · f toggle live · r refresh"
+            f"GROK_HOME={core.GROK_HOME} · theme={label} · "
+            f"live={'on' if self.live_follow else 'off'} · m theme · ? help · q quit"
         )
+
+    def _apply_theme(self, name: str, *, persist: bool = True, notify: bool = True) -> None:
+        """Set Screen class theme-night | theme-day | theme-indigo."""
+        name = themes.normalize_theme(name)
+        self._ui_theme = name
+        try:
+            screen = self.screen
+            for tid in themes.THEME_IDS:
+                screen.remove_class(f"theme-{tid}")
+            screen.add_class(themes.theme_class(name))
+        except Exception:
+            pass
+        if persist:
+            themes.save_theme(name)
+        label = themes.THEME_LABELS.get(name, name)
+        if notify:
+            try:
+                self.notify(f"Theme: {label}")
+                self.set_status(f"Theme: {label} · press m to cycle · saved for next launch")
+            except Exception:
+                pass
+
+    def action_cycle_theme(self) -> None:
+        nxt = themes.next_theme(self._ui_theme)
+        self._apply_theme(nxt, persist=True, notify=True)
 
     def _start_live_poll(self) -> None:
         if self._poll_timer is not None:
