@@ -81,10 +81,10 @@ class HelpScreen(ModalScreen[None]):
   e/x · E/X      Expand one tool / all tools (works without clicking chat)
   [ / ]          Move tool focus in chat
   f              Toggle live auto-follow (on by default)
-  q / Ctrl+C     Quit
+  q / Ctrl+C     Quit (in tmux: ends whole grok-alt session → back to shell)
 
-[dim]Live mode polls session files every ~1s so tmux traces update while you chat.
-Press r anytime for a full refresh. Official Grok UI: g / c / R.[/dim]
+[dim]Live mode polls session files so traces update while you chat.
+Select a prompt to scroll there and expand that turn's tools. Official Grok: g / c / R.[/dim]
 """,
                 id="help-body",
             ),
@@ -334,7 +334,8 @@ class GrokAltApp(App):
 
     # priority=True: work even when focus is on ListView / Input / RichLog (tmux UX)
     BINDINGS = [
-        Binding("q", "quit", "Quit", priority=True),
+        Binding("q", "quit_app", "Quit", priority=True),
+        Binding("ctrl+c", "quit_app", "Quit", show=False, priority=True),
         Binding("question_mark", "help", "Help", priority=True),
         Binding("r", "refresh", "Refresh", priority=True),
         Binding("f", "toggle_live", "Live", priority=True),
@@ -557,6 +558,45 @@ class GrokAltApp(App):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_quit_app(self) -> None:
+        """Leave the TUI; under grok-alt-tmux, kill that session so you return to the shell."""
+        self._shutdown_tmux_companion()
+        self.exit()
+
+    def _shutdown_tmux_companion(self) -> None:
+        """Kill the dedicated tmux session (default name ``grok-alt``) when quitting from inside it.
+
+        Set ``GROK_ALT_KILL_TMUX_ON_QUIT=0`` to only exit the TUI pane (old behaviour).
+        Standalone ``grok-alt`` outside tmux is unchanged.
+        """
+        if not os.environ.get("TMUX"):
+            return
+        if os.environ.get("GROK_ALT_KILL_TMUX_ON_QUIT", "1").lower() in ("0", "false", "no"):
+            return
+        session = os.environ.get("GROK_ALT_TMUX_SESSION", "grok-alt")
+        try:
+            cur = subprocess.run(
+                ["tmux", "display-message", "-p", "#S"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            cur_name = (cur.stdout or "").strip()
+        except Exception:
+            cur_name = ""
+        # Only kill our companion session, not a random tmux the user happened to run TUI in
+        if cur_name and cur_name != session:
+            return
+        try:
+            subprocess.Popen(
+                ["tmux", "kill-session", "-t", f"={session}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
 
     def _ensure_chat_ready_for_tools(self) -> bool:
         """Switch to Chat tab and ensure tool list is built. Returns False if impossible."""
@@ -1362,6 +1402,7 @@ class GrokAltApp(App):
             count = 0
             user_n = 0
             tool_n = 0
+            current_prompt = -1  # 0-based; tools after a user msg belong to that turn
             for m in msgs:
                 role = m.get("role", "?")
                 if self.hide_tools_in_chat and role == "tool":
@@ -1369,6 +1410,7 @@ class GrokAltApp(App):
                 count += 1
                 if role == "user":
                     user_n += 1
+                    current_prompt = user_n - 1
                     text = m.get("text") or ""
                     self._prompt_texts.append(text)
                     stream.mount(
@@ -1399,9 +1441,25 @@ class GrokAltApp(App):
                     tool_n += 1
                     key = self._tool_key(m, tool_n - 1)
                     wid = self._tool_widget_id(tool_n, key)
-                    expanded = self._is_tool_expanded(key)
+                    # Open tools for the selected / last turn so picking a session isn't "blank until Expand all"
+                    turn_pi = current_prompt
+                    focus_pi = self._selected_prompt_index
+                    if focus_pi is None and self._prompt_texts:
+                        focus_pi = len(self._prompt_texts)  # not yet appended for this user; use after loop default
+                    # During build, prefer explicit selection; else we'll expand last turn after nav is set
+                    expanded = self._is_tool_expanded(key) or (
+                        focus_pi is not None and turn_pi == focus_pi
+                    )
                     self._tool_id_to_key[wid] = key
-                    self._chat_tools.append({"key": key, "msg": m, "widget_id": wid, "num": tool_n})
+                    self._chat_tools.append(
+                        {
+                            "key": key,
+                            "msg": m,
+                            "widget_id": wid,
+                            "num": tool_n,
+                            "prompt_index": turn_pi,
+                        }
+                    )
                     title = self._tool_collapsible_title(m, tool_num=tool_n)
                     # Full body always mounted; CollapsibleTitle provides ▶ toggle (do not strip children later)
                     col = Collapsible(
@@ -1416,6 +1474,8 @@ class GrokAltApp(App):
                         id=wid,
                     )
                     stream.mount(col)
+                    if expanded and key:
+                        self._tools_expanded.add(key)
                 elif role == "system":
                     stream.mount(
                         Static(
@@ -1433,7 +1493,7 @@ class GrokAltApp(App):
             stream.mount(
                 Static(
                     f"[dim]{count} blocks · {user_n} prompt(s) · {n_tools} tool(s) "
-                    f"({n_open} open) · click ▸ title to expand · toolbar = all[/dim]",
+                    f"({n_open} open) · select a prompt = expand that turn · q quits tmux session[/dim]",
                     classes="chat-footer",
                     markup=True,
                     shrink=True,
@@ -1449,11 +1509,17 @@ class GrokAltApp(App):
             self._last_chat_structure_sig = struct_sig
         finally:
             self._rendering_chat = False
+        # After first paint for a session, open the focused turn (selected or last)
+        reveal_idx = self._pending_prompt_jump
+        if reveal_idx is None and self._selected_prompt_index is not None:
+            reveal_idx = self._selected_prompt_index
         if self._pending_prompt_jump is not None:
             idx = self._pending_prompt_jump
             self._pending_prompt_jump = None
             self._set_selected_prompt_index(idx)
-            self.call_after_refresh(lambda: self._scroll_chat_to_prompt(idx))
+            self.call_after_refresh(lambda i=idx: self._reveal_turn(i))
+        elif reveal_idx is not None and self._prompt_texts:
+            self.call_after_refresh(lambda i=reveal_idx: self._reveal_turn(i, scroll=True))
 
     @staticmethod
     def _count_user_msgs(msgs: list[dict]) -> int:
@@ -1708,9 +1774,63 @@ class GrokAltApp(App):
             stream.scroll_to_widget(w, animate=False, top=True)
         except Exception:
             pass
-        total = len(self._prompt_texts)
-        preview = self._prompt_preview(self._prompt_texts[index], 48)
-        self.set_status(f"Jumped to prompt #{index + 1}/{total}: {preview}")
+
+    def _expand_tools_for_prompt(self, prompt_index: int) -> int:
+        """Open all tool collapsibles that belong to this user turn. Returns how many opened."""
+        if prompt_index < 0:
+            return 0
+        opened = 0
+        self._rendering_chat = True
+        try:
+            for t in self._chat_tools:
+                if t.get("prompt_index") != prompt_index:
+                    continue
+                key = t.get("key")
+                wid = t.get("widget_id")
+                if key:
+                    self._tools_expanded.add(key)
+                if not wid:
+                    continue
+                try:
+                    col = self.query_one(f"#{wid}", Collapsible)
+                    if col.collapsed:
+                        col.collapsed = False
+                    opened += 1
+                except Exception:
+                    continue
+        finally:
+            self._rendering_chat = False
+        return opened
+
+    def _reveal_turn(self, index: int, *, scroll: bool = True) -> None:
+        """Select a user turn: expand its tools and scroll the chat stream to that prompt.
+
+        Fixes “switched session / picked a turn but only Expand all shows anything”.
+        """
+        if index is None or index < 0:
+            return
+        if self._prompt_texts and index >= len(self._prompt_texts):
+            index = len(self._prompt_texts) - 1
+        self._selected_prompt_index = index
+        n_open = self._expand_tools_for_prompt(index)
+        if scroll:
+            self._scroll_chat_to_prompt(index)
+        total = len(self._prompt_texts) or 1
+        preview = ""
+        if 0 <= index < len(self._prompt_texts):
+            preview = self._prompt_preview(self._prompt_texts[index], 40)
+        try:
+            self.set_status(
+                f"Turn #{index + 1}/{total} · {n_open} tool(s) expanded · "
+                f"5 = diffs · d = export · q = quit"
+                + (f" · {preview}" if preview else "")
+            )
+        except Exception:
+            pass
+        try:
+            self.query_one("#chat-stream", VerticalScroll).focus()
+        except Exception:
+            pass
 
     def _set_selected_prompt_index(self, idx: int | None) -> None:
         """Pin which user prompt/turn the Diffs tab (and status) refer to."""
@@ -1772,30 +1892,18 @@ class GrokAltApp(App):
         self.call_after_refresh(
             lambda g=gen, i=idx: self._ensure_prompt_nav_visible(i, expect_gen=g)
         )
-        # Switch focus to chat body and scroll to the turn
+        # Switch focus to chat body, scroll, and expand tools for this turn
         try:
             tabs = self.query_one(TabbedContent)
             tabs.active = "chat"
         except Exception:
             pass
         if not self._prompt_texts:
-            # Chat not rendered yet — queue jump after next render
+            # Chat not rendered yet — queue reveal after next render
             self._pending_prompt_jump = idx
-            self.render_chat()
+            self.render_chat(force=True)
             return
-        self._scroll_chat_to_prompt(idx)
-        preview = self._prompt_preview(self._prompt_texts[idx], 40) if idx < len(self._prompt_texts) else ""
-        try:
-            self.set_status(
-                f"Prompt #{idx + 1}/{len(self._prompt_texts)} selected · "
-                f"5 = diffs · d = export turn · {preview}"
-            )
-        except Exception:
-            pass
-        try:
-            self.query_one("#chat-stream", VerticalScroll).focus()
-        except Exception:
-            pass
+        self._reveal_turn(idx, scroll=True)
 
     def render_diffs(self) -> None:
         """Populate Diffs tab for the *selected user prompt/turn* only (not whole session)."""
