@@ -35,8 +35,6 @@ from . import pretty
 
 # Live-follow poll interval (seconds). Slightly gentler default — full chat remounts are expensive.
 LIVE_POLL_INTERVAL = float(os.environ.get("GROK_ALT_POLL_INTERVAL", "1.5"))
-# Placeholder inside collapsed tools (full Rich body only mounted when expanded).
-_TOOL_BODY_PLACEHOLDER = "[dim]Expand for full tool output…[/dim]"
 
 
 class HelpScreen(ModalScreen[None]):
@@ -382,8 +380,7 @@ class GrokAltApp(App):
         self._rendering_chat = False
         self._last_chat_fp = ""  # session data fingerprint (not expand state)
         self._last_chat_structure_sig = ""  # roles/tool ids — skip full remount when stable
-        self._chat_msgs: list[dict] = []  # last built message list (for lazy tool fill)
-        self._tool_body_filled: set[str] = set()  # widget ids with full body mounted
+        self._chat_msgs: list[dict] = []  # last built message list (for in-place tool updates)
         self._diff_files: list[dict] = []  # session file changes for Diffs tab
         self._diff_by_id: dict[str, dict] = {}
         self._diff_selected_path: str | None = None
@@ -634,8 +631,6 @@ class GrokAltApp(App):
                     continue
                 try:
                     col = self.query_one(f"#{wid}", Collapsible)
-                    if not collapsed:
-                        self._fill_tool_body(wid, t.get("msg") or {})
                     if col.collapsed != collapsed:
                         col.collapsed = collapsed
                     updated += 1
@@ -650,46 +645,47 @@ class GrokAltApp(App):
         else:
             self.set_status(f"Expanded {updated}/{n} tools — click a row or Collapse all to close")
 
-    def _tool_placeholder_static(self) -> Static:
-        return Static(
-            _TOOL_BODY_PLACEHOLDER,
-            classes="tool-body",
-            markup=True,
-            shrink=True,
-        )
-
     def _tool_detail_renderable(self, msg: dict):
         try:
             return pretty.render_tool_detail(msg)
         except Exception:
             return self._tool_detail_markup(msg)
 
-    def _fill_tool_body(self, wid: str, msg: dict, *, force: bool = False) -> None:
-        """Mount full tool detail into an existing Collapsible (lazy — skip if already filled)."""
+    def _update_tool_collapsible(self, wid: str, msg: dict, *, tool_num: int = 1) -> bool:
+        """Refresh title + body of an existing tool Collapsible without destroying its chrome.
+
+        Textual's Collapsible owns a CollapsibleTitle child — never remove_children() on
+        the Collapsible itself or the ▶ header / toggle is gone.
+        """
         if not wid:
-            return
-        if not force and wid in self._tool_body_filled:
-            return
+            return False
         try:
             col = self.query_one(f"#{wid}", Collapsible)
         except Exception:
-            return
+            return False
+        try:
+            col.title = self._tool_collapsible_title(msg, tool_num=tool_num)
+        except Exception:
+            pass
         detail = self._tool_detail_renderable(msg)
         try:
-            # Replace children with one Static holding the full renderable
-            for child in list(col.children):
+            body = col.query_one(".tool-body", Static)
+            body.update(detail)
+            return True
+        except Exception:
+            pass
+        # Body missing — mount only into Contents, never wipe CollapsibleTitle
+        try:
+            contents = col.query_one(Collapsible.Contents)
+            for child in list(contents.children):
                 try:
                     child.remove()
                 except Exception:
                     pass
-            col.mount(Static(detail, classes="tool-body", markup=False, shrink=True))
-            self._tool_body_filled.add(wid)
+            contents.mount(Static(detail, classes="tool-body", markup=False, shrink=True))
+            return True
         except Exception:
-            try:
-                col.mount(Static(self._tool_detail_markup(msg), classes="tool-body", markup=True, shrink=True))
-                self._tool_body_filled.add(wid)
-            except Exception:
-                pass
+            return False
 
     @staticmethod
     def _chat_structure_sig(msgs: list[dict]) -> str:
@@ -718,14 +714,13 @@ class GrokAltApp(App):
         return "|".join(parts)
 
     def _patch_chat_tools_in_place(self, msgs: list[dict]) -> bool:
-        """Update tool titles/data without tearing down the chat widget tree. Returns False if must remount."""
+        """Update tool titles/bodies without tearing down the chat widget tree."""
         if self.hide_tools_in_chat:
             return False
         tool_msgs = [m for m in msgs if m.get("role") == "tool"]
         if len(tool_msgs) != len(self._chat_tools):
             return False
         for t, m in zip(self._chat_tools, tool_msgs):
-            key = t.get("key")
             tid = m.get("tool_call_id")
             old_tid = (t.get("msg") or {}).get("tool_call_id")
             if tid and old_tid and tid != old_tid:
@@ -734,18 +729,9 @@ class GrokAltApp(App):
             wid = t.get("widget_id")
             if not wid:
                 continue
-            title = self._tool_collapsible_title(m, tool_num=int(t.get("num") or 1))
-            try:
-                col = self.query_one(f"#{wid}", Collapsible)
-                col.title = title
-                # Refresh body only if user already has it open (keeps live accuracy without cost for collapsed)
-                if not col.collapsed or self._is_tool_expanded(key or ""):
-                    self._tool_body_filled.discard(wid)
-                    self._fill_tool_body(wid, m, force=True)
-            except Exception:
+            if not self._update_tool_collapsible(wid, m, tool_num=int(t.get("num") or 1)):
                 return False
         self._chat_msgs = msgs
-        # Prompt texts may grow in-place rarely; refresh nav without list thrash when possible
         prompts = [m.get("text") or "" for m in msgs if m.get("role") == "user"]
         self._prompt_texts = prompts
         self._render_prompt_nav(prompts)
@@ -753,7 +739,7 @@ class GrokAltApp(App):
 
     @on(Collapsible.Expanded)
     def on_tool_collapsible_expanded(self, event: Collapsible.Expanded) -> None:
-        """Keep expand-state in sync when user clicks a tool row open; lazy-load full body."""
+        """Keep expand-state in sync when user clicks a tool row open."""
         if self._rendering_chat:
             return
         w = event.collapsible
@@ -765,13 +751,12 @@ class GrokAltApp(App):
             return
         if not self._tools_expand_all:
             self._tools_expanded.add(key)
-        msg = {}
         for i, t in enumerate(self._chat_tools):
             if t.get("key") == key:
                 self._tool_focus_idx = i
-                msg = t.get("msg") or {}
+                # Refresh body from latest msg (title already on widget)
+                self._update_tool_collapsible(wid, t.get("msg") or {}, tool_num=int(t.get("num") or 1))
                 break
-        self._fill_tool_body(wid, msg)
         try:
             label = getattr(event.collapsible, "title", None) or key
             self.set_status(f"Tool expanded (click title again to collapse) · {str(label)[:55]}")
@@ -798,18 +783,7 @@ class GrokAltApp(App):
             }
         else:
             self._tools_expanded.discard(key)
-        # Drop heavy body to free memory; next expand refills (placeholder stays until then)
-        try:
-            if wid in self._tool_body_filled:
-                for child in list(w.children):
-                    try:
-                        child.remove()
-                    except Exception:
-                        pass
-                w.mount(self._tool_placeholder_static())
-                self._tool_body_filled.discard(wid)
-        except Exception:
-            pass
+        # Do NOT remove Collapsible children — that destroys CollapsibleTitle (no header/toggle).
         try:
             self.set_status("Tool collapsed — click another ▸ row or use Expand all tools")
         except Exception:
@@ -953,7 +927,6 @@ class GrokAltApp(App):
             self._last_chat_fp = ""
             self._last_chat_structure_sig = ""
             self._chat_msgs = []
-            self._tool_body_filled.clear()
             self._selected_prompt_index = None  # new session → re-resolve prompt for diffs
             self._diff_selected_path = None
             self._last_prompt_nav_key = None  # force prompt ListView rebuild
@@ -1336,7 +1309,6 @@ class GrokAltApp(App):
                 )
                 self._chat_tools = []
                 self._tool_id_to_key = {}
-                self._tool_body_filled.clear()
                 self._chat_msgs = []
                 self._last_chat_structure_sig = ""
                 self._render_prompt_nav([])
@@ -1377,7 +1349,6 @@ class GrokAltApp(App):
             self._prompt_texts = []
             self._chat_tools = []
             self._tool_id_to_key = {}
-            self._tool_body_filled.clear()
             self._chat_msgs = msgs
 
             if not msgs:
@@ -1432,25 +1403,19 @@ class GrokAltApp(App):
                     self._tool_id_to_key[wid] = key
                     self._chat_tools.append({"key": key, "msg": m, "widget_id": wid, "num": tool_n})
                     title = self._tool_collapsible_title(m, tool_num=tool_n)
-                    # Lazy body: placeholder until expand (or pre-fill if already expanded)
-                    if expanded:
-                        body_widget: Static = Static(
+                    # Full body always mounted; CollapsibleTitle provides ▶ toggle (do not strip children later)
+                    col = Collapsible(
+                        Static(
                             self._tool_detail_renderable(m),
                             classes="tool-body",
                             markup=False,
                             shrink=True,
-                        )
-                    else:
-                        body_widget = self._tool_placeholder_static()
-                    col = Collapsible(
-                        body_widget,
+                        ),
                         title=title,
                         collapsed=not expanded,
                         id=wid,
                     )
                     stream.mount(col)
-                    if expanded:
-                        self._tool_body_filled.add(wid)
                 elif role == "system":
                     stream.mount(
                         Static(
@@ -1468,7 +1433,7 @@ class GrokAltApp(App):
             stream.mount(
                 Static(
                     f"[dim]{count} blocks · {user_n} prompt(s) · {n_tools} tool(s) "
-                    f"({n_open} open) · expand = full output · toolbar = all[/dim]",
+                    f"({n_open} open) · click ▸ title to expand · toolbar = all[/dim]",
                     classes="chat-footer",
                     markup=True,
                     shrink=True,
