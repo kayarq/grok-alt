@@ -183,6 +183,7 @@ class GrokAltApp(App):
         self._pending_prompt_jump: int | None = None
         self._last_prompt_nav_key: tuple | None = None  # skip ListView rebuild when unchanged
         self._ui_theme: str = themes.load_theme()
+        themes.set_active_theme(self._ui_theme)
 
     @staticmethod
     def _safe_list_index(lv: ListView, index: int | None) -> None:
@@ -316,9 +317,10 @@ class GrokAltApp(App):
         )
 
     def _apply_theme(self, name: str, *, persist: bool = True, notify: bool = True) -> None:
-        """Set Screen class theme-night | theme-day | theme-indigo."""
+        """Set Screen class theme-* and sync Rich text palettes (pretty / timeline)."""
         name = themes.normalize_theme(name)
         self._ui_theme = name
+        themes.set_active_theme(name)
         try:
             screen = self.screen
             for tid in themes.THEME_IDS:
@@ -328,11 +330,23 @@ class GrokAltApp(App):
             pass
         if persist:
             themes.save_theme(name)
+        # Re-paint content that embeds Rich styles (not only chrome CSS)
+        try:
+            self._last_chat_fp = ""
+            self._last_chat_structure_sig = ""
+            if self.selected:
+                self.render_timeline()
+                self.render_chat(force=True)
+                self.render_overview()
+                self.render_logs()
+                self.render_diffs()
+        except Exception:
+            pass
         label = themes.THEME_LABELS.get(name, name)
         if notify:
             try:
                 self.notify(f"Theme: {label}")
-                self.set_status(f"Theme: {label} · press m to cycle · saved for next launch")
+                self.set_status(f"Theme: {label} · m cycles · fonts+panes update")
             except Exception:
                 pass
 
@@ -358,6 +372,29 @@ class GrokAltApp(App):
 
     def set_status(self, msg: str) -> None:
         self.query_one("#status-line", Static).update(msg)
+
+    def _sess_meta_markup(self) -> str:
+        return {"day": "dark_blue", "indigo": "cyan"}.get(self._ui_theme, "dim")
+
+    def _ov_key(self) -> str:
+        return {"day": "blue", "indigo": "magenta"}.get(self._ui_theme, "cyan")
+
+    def _prompt_label_markup(self, i: int, total: int, preview: str) -> str:
+        if self._ui_theme == "day":
+            return (
+                f"[bold dark_green]#{i + 1}[/bold dark_green]  "
+                f"[dim]{i + 1}/{total}[/dim]\n{preview}"
+            )
+        if self._ui_theme == "indigo":
+            return (
+                f"[bold green]#{i + 1}[/bold green]  "
+                f"[cyan]{i + 1}/{total}[/cyan]\n{preview}"
+            )
+        return (
+            f"[bold bright_green]#{i + 1}[/bold bright_green]  "
+            f"[dim]{i + 1}/{total}[/dim]\n{preview}"
+        )
+
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
@@ -845,7 +882,7 @@ class GrokAltApp(App):
                 item_id = f"si{gen}-{shown}"
                 lv.append(
                     ListItem(
-                        Label(f"[b]{self._escape(title)}[/b]\n[dim]{self._escape(meta)}[/dim]"),
+                        Label(f"[b]{self._escape(title)}[/b]\n[{self._sess_meta_markup()}]{self._escape(meta)}[/{self._sess_meta_markup()}]"),
                         id=item_id,
                     )
                 )
@@ -1097,24 +1134,40 @@ class GrokAltApp(App):
             log.write("[dim]No timeline events[/dim]")
             return
         cat_style = {
-            "turn": "green",
-            "tool": "yellow",
-            "user": "bright_green",
-            "agent": "cyan",
-            "phase": "dim",
-            "permission": "red",
-            "stream": "magenta",
-            "meta": "blue",
-            "other": "white",
+            "turn": themes.rich_style("tl_turn"),
+            "tool": themes.rich_style("tl_tool"),
+            "user": themes.rich_style("tl_user"),
+            "agent": themes.rich_style("tl_agent"),
+            "phase": themes.rich_style("dim"),
+            "permission": themes.rich_style("tl_perm"),
+            "stream": themes.rich_style("tl_stream"),
+            "meta": themes.rich_style("tl_meta"),
+            "other": themes.rich_style("tl_other"),
         }
         for it in items:
-            style = cat_style.get(it.get("category", "other"), "white")
-            t = core.fmt_time(it.get("ts"))
+            style = cat_style.get(it.get("category", "other"), themes.rich_style("tl_other"))
+            ts = core.fmt_time(it.get("ts"))
             title = self._escape(it.get("title") or "")
-            log.write(f"[dim]{t}[/dim] [{style}]●[/{style}] {title}")
+            # Textual markup: style may include spaces — use style= form via Rich if needed; strip to simple tokens
+            st = style.replace(" ", "") if " " not in style or style.startswith("#") else style
+            # Prefer bracket styles that work in RichLog markup (simple names)
+            simple = {
+                "turn": "green", "tool": "yellow", "user": "bright_green", "agent": "cyan",
+                "phase": "dim", "permission": "red", "stream": "magenta", "meta": "blue", "other": "white",
+            }.get(it.get("category", "other"), "white")
+            if self._ui_theme == "day":
+                simple = {
+                    "turn": "green", "tool": "dark_orange3", "user": "green", "agent": "blue",
+                    "phase": "dim", "permission": "red", "stream": "magenta", "meta": "blue", "other": "black",
+                }.get(it.get("category", "other"), "black")
+            elif self._ui_theme == "indigo":
+                simple = {
+                    "turn": "green", "tool": "yellow", "user": "bright_green", "agent": "bright_magenta",
+                    "phase": "dim", "permission": "red", "stream": "magenta", "meta": "cyan", "other": "white",
+                }.get(it.get("category", "other"), "white")
+            log.write(f"[cyan]{ts}[/cyan] [{simple}]●[/{simple}] {title}")
             detail = it.get("detail")
             if detail:
-                # Multi-line tool summaries: show first 3 lines indented
                 lines = str(detail).splitlines() or [str(detail)]
                 for i, line in enumerate(lines[:3]):
                     d = self._escape(line[:200])
@@ -1496,10 +1549,7 @@ class GrokAltApp(App):
             for i, text in enumerate(prompts):
                 preview = self._escape(self._prompt_preview(text))
                 # Show newest at bottom (natural order = turn order)
-                label = (
-                    f"[bold bright_green]#{i + 1}[/bold bright_green]  "
-                    f"[dim]{i + 1}/{total}[/dim]\n{preview}"
-                )
+                label = self._prompt_label_markup(i, total, preview)
                 lv.append(ListItem(Label(label), id=f"pn{gen}-{i}"))
             # Prefer selected prompt; else last (most recent)
             hi = prefer_idx if prefer_idx is not None else total - 1
@@ -1908,17 +1958,18 @@ class GrokAltApp(App):
         s = ov.get("summary") or {}
         sig = ov.get("signals") or {}
         info = s.get("info") or {}
+        ok = self._ov_key()
         log.write("[bold]Session overview[/bold]\n")
-        log.write(f"  [cyan]title[/cyan]  {self._escape(s.get('generated_title') or s.get('session_summary') or '—')}")
-        log.write(f"  [cyan]id[/cyan]     {info.get('id') or self.selected and self.selected.get('id')}")
-        log.write(f"  [cyan]cwd[/cyan]    {self._escape(info.get('cwd') or self.selected and self.selected.get('cwd') or '—')}")
-        log.write(f"  [cyan]model[/cyan]  {s.get('current_model_id') or '—'}")
-        log.write(f"  [cyan]agent[/cyan]  {s.get('agent_name') or '—'}")
-        log.write(f"  [cyan]msgs[/cyan]   {s.get('num_messages')} total · {s.get('num_chat_messages')} chat")
-        log.write(f"  [cyan]tokens[/cyan] {sig.get('total_tokens', '—')} · tools {sig.get('tool_calls', '—')}")
-        log.write(f"  [cyan]created[/cyan] {s.get('created_at') or '—'}")
-        log.write(f"  [cyan]updated[/cyan] {s.get('updated_at') or s.get('last_active_at') or '—'}")
-        log.write(f"  [cyan]path[/cyan]   {self._escape(ov.get('path') or '')}")
+        log.write(f"  [{ok}]title[/{ok}]  {self._escape(s.get('generated_title') or s.get('session_summary') or '—')}")
+        log.write(f"  [{ok}]id[/{ok}]     {info.get('id') or self.selected and self.selected.get('id')}")
+        log.write(f"  [{ok}]cwd[/{ok}]    {self._escape(info.get('cwd') or self.selected and self.selected.get('cwd') or '—')}")
+        log.write(f"  [{ok}]model[/{ok}]  {s.get('current_model_id') or '—'}")
+        log.write(f"  [{ok}]agent[/{ok}]  {s.get('agent_name') or '—'}")
+        log.write(f"  [{ok}]msgs[/{ok}]   {s.get('num_messages')} total · {s.get('num_chat_messages')} chat")
+        log.write(f"  [{ok}]tokens[/{ok}] {sig.get('total_tokens', '—')} · tools {sig.get('tool_calls', '—')}")
+        log.write(f"  [{ok}]created[/{ok}] {s.get('created_at') or '—'}")
+        log.write(f"  [{ok}]updated[/{ok}] {s.get('updated_at') or s.get('last_active_at') or '—'}")
+        log.write(f"  [{ok}]path[/{ok}]   {self._escape(ov.get('path') or '')}")
         log.write("\n[bold]Event types[/bold] (events.jsonl)")
         for k, v in list((ov.get("event_types") or {}).items())[:20]:
             log.write(f"  {k:28} {v}")
@@ -1959,7 +2010,8 @@ class GrokAltApp(App):
             extra = ""
             if isinstance(ctx, dict):
                 extra = " " + json.dumps(ctx, ensure_ascii=False)[:100]
-            log.write(f"[dim]{ts}[/dim] [magenta]{src}[/magenta] [cyan]{self._escape(msg)}[/cyan][dim]{self._escape(extra)}[/dim]")
+            mk = {"day": ("purple", "blue"), "indigo": ("magenta", "cyan")}.get(self._ui_theme, ("magenta", "cyan"))
+            log.write(f"[dim]{ts}[/dim] [{mk[0]}]{src}[/{mk[0]}] [{mk[1]}]{self._escape(msg)}[/{mk[1]}][dim]{self._escape(extra)}[/dim]")
         log.write(f"\n[dim]{len(entries)} log lines · filtered to this session[/dim]")
 
     # ── Launch real Grok ──────────────────────────────────────────
