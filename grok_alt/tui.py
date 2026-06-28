@@ -366,6 +366,7 @@ class GrokAltApp(App):
         self._populating_prompts = False
         self._pending_prompt_jump: int | None = None
         self._last_prompt_nav_key: tuple | None = None  # skip ListView rebuild when unchanged
+        self._chat_mount_gen = 0  # unique prompt-/tool- ids across remounts
 
     @staticmethod
     def _safe_list_index(lv: ListView, index: int | None) -> None:
@@ -1374,18 +1375,35 @@ class GrokAltApp(App):
         stream = self.query_one("#chat-stream", VerticalScroll)
         self._rendering_chat = True
         try:
+            # Hard clear — remove_children alone can leave IDs in the node map briefly
             try:
+                for child in list(stream.children):
+                    try:
+                        child.remove()
+                    except Exception:
+                        pass
                 stream.remove_children()
             except Exception:
                 pass
+            self._chat_mount_gen += 1
+            gen = self._chat_mount_gen
             self._prompt_line_offsets = []
             self._prompt_texts = []
             self._chat_tools = []
             self._tool_id_to_key = {}
             self._chat_msgs = msgs
+            # prompt index -> widget id for scroll (generation-scoped)
+            self._prompt_widget_ids: dict[int, str] = {}
 
             if not msgs:
-                stream.mount(Static("[dim]No chat content[/dim]", classes="chat-block", markup=True))
+                stream.mount(
+                    Static(
+                        "[dim]No chat content[/dim]",
+                        id=f"chat-empty-{gen}",
+                        classes="chat-block",
+                        markup=True,
+                    )
+                )
                 self._render_prompt_nav([])
                 self._last_chat_fp = chat_fp
                 self._last_chat_structure_sig = struct_sig
@@ -1406,15 +1424,27 @@ class GrokAltApp(App):
                     current_prompt = user_n - 1
                     text = m.get("text") or ""
                     self._prompt_texts.append(text)
-                    stream.mount(
-                        Static(
-                            pretty.render_user_message(text, num=user_n, total=user_total),
-                            id=f"prompt-block-{user_n - 1}",
-                            classes="chat-user chat-block",
-                            markup=False,
-                            shrink=True,
+                    pwid = f"pb{gen}-{user_n - 1}"
+                    self._prompt_widget_ids[user_n - 1] = pwid
+                    try:
+                        stream.mount(
+                            Static(
+                                pretty.render_user_message(text, num=user_n, total=user_total),
+                                id=pwid,
+                                classes="chat-user chat-block",
+                                markup=False,
+                                shrink=True,
+                            )
                         )
-                    )
+                    except Exception:
+                        stream.mount(
+                            Static(
+                                pretty.render_user_message(text, num=user_n, total=user_total),
+                                classes="chat-user chat-block",
+                                markup=False,
+                                shrink=True,
+                            )
+                        )
                 elif role in ("assistant", "agent"):
                     from rich.console import Group as RichGroup
 
@@ -1433,7 +1463,9 @@ class GrokAltApp(App):
                 elif role == "tool":
                     tool_n += 1
                     key = self._tool_key(m, tool_n - 1)
-                    wid = self._tool_widget_id(tool_n, key)
+                    wid = f"t{gen}-{tool_n}-{self._tool_widget_id(tool_n, key)[5:]}"  # gen prefix
+                    if len(wid) > 80:
+                        wid = f"t{gen}-{tool_n}"
                     # Open tools for the selected / last turn so picking a session isn't "blank until Expand all"
                     turn_pi = current_prompt
                     focus_pi = self._selected_prompt_index
@@ -1760,7 +1792,7 @@ class GrokAltApp(App):
         """Scroll chat stream so the chosen user prompt is in view."""
         if index < 0 or index >= len(self._prompt_texts):
             return
-        wid = f"prompt-block-{index}"
+        wid = getattr(self, "_prompt_widget_ids", {}).get(index) or f"pb{self._chat_mount_gen}-{index}"
         try:
             stream = self.query_one("#chat-stream", VerticalScroll)
             w = self.query_one(f"#{wid}")
