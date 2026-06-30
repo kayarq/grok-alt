@@ -206,18 +206,43 @@ grok-alt version
 - Files changed **during the selected prompt/turn** (fallback: last turn / whole session metadata).
 - Pick a file on the left → colored unified diff on the right.
 
-### Turn export (`d`)
+### Turn exports (`d` / `D` / `y`)
 
-Writes under `GROK_ALT_TURN_EXPORT_DIR` (default `~/grok-turn-exports/`):
+Writes under `GROK_ALT_TURN_EXPORT_DIR` (default `~/grok-turn-exports/`). Names include a **session title slug**, **8-char session id**, and **turn number** (plus a short prompt slug on turn folders).
+
+| Key | Action |
+|-----|--------|
+| **`d`** | Export **selected** turn only |
+| **`D`** | **Full chat** — all completed turns |
+| **`y`** | **Range** — modal: 1-based from/to turn numbers |
+
+**Single turn** layout:
 
 ```text
-turn-<session8>-<nnn>.md
-turn-<session8>-<nnn>-files/     # optional copied artifacts (terminal logs, downloads, …)
+{title}_{sid8}_turn-NNN_{prompt-slug}/
+  {title}_{sid8}_turn-NNN.md
+  files/                         # optional artifacts (terminal logs, downloads, …)
 ```
 
-Markdown sections: **Prompt**, **Trace** (tools + optional timeline/file changes), **Response**.
+**Full chat / range** layout (mother folder + one child per turn + flat md pack):
 
-**v2 rule:** if the turn is still in progress (no `turn_completed` and no later user prompt yet), export is **blocked** with a warning — wait for the agent to finish, then press `d` again. After `turn_completed`, a short settle delay (`GROK_ALT_TURN_SETTLE_SECONDS`, default `1`) allows late log flushes.
+```text
+{title}_{sid8}_full-chat_turns-001-0NN_<timestamp}/   # or …_range-AAA-BBB_<timestamp>/
+  INDEX.md
+  all-turn-md-exports/              # all turn .md copies only (no files/ trees)
+    {title}_{sid8}_turn-001.md
+    {title}_{sid8}_turn-002.md
+    …
+  {title}_{sid8}_turn-001_{prompt-slug}/   # full detail per turn
+    {title}_{sid8}_turn-001.md
+    files/
+  {title}_{sid8}_turn-002_…/
+    …
+```
+
+Markdown sections per turn: **Prompt**, **Trace** (tools + optional timeline/file changes), **Response**.
+
+**v2 rule:** if a turn is still in progress (no `turn_completed` and no later user prompt yet), that turn is **blocked / skipped** (single-turn export warns and aborts; batch exports skip incomplete turns and list them in `INDEX.md`). After `turn_completed`, a short settle delay (`GROK_ALT_TURN_SETTLE_SECONDS`, default `1`) allows late log flushes.
 
 ### Privacy
 

@@ -24,7 +24,44 @@ UUID_RE = re.compile(
     re.I,
 )
 
+# Grok injects these as synthetic user_message_chunk rows (bg task done, hooks, …).
+# They must not count as real user turns in chat, prompt nav, export, or diffs.
+_SYSTEM_REMINDER_OPEN = re.compile(r"^\s*<system-reminder\b", re.I)
+_SYSTEM_REMINDER_ONLY = re.compile(
+    r"^\s*(?:<system-reminder\b[\s\S]*?</system-reminder>\s*)+\s*$",
+    re.I,
+)
+
 DEFAULT_GROK_BIN = Path.home() / ".grok" / "bin" / "grok"
+
+
+def user_message_chunk_text(update: dict | None) -> str:
+    if not isinstance(update, dict):
+        return ""
+    content = update.get("content")
+    if isinstance(content, dict):
+        return content.get("text") or ""
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def is_system_reminder_text(text: str | None) -> bool:
+    """True for Grok ``<system-reminder>…`` injections (not real user prompts)."""
+    if not text:
+        return False
+    s = text.strip()
+    if not s:
+        return False
+    if _SYSTEM_REMINDER_OPEN.match(s):
+        return True
+    if _SYSTEM_REMINDER_ONLY.match(s):
+        return True
+    return False
+
+
+def is_system_reminder_user_update(update: dict | None) -> bool:
+    return is_system_reminder_text(user_message_chunk_text(update))
 
 
 def grok_binary() -> str:
@@ -321,7 +358,11 @@ def summarize_event(ev: dict) -> str:
 
 def format_update_title(update: dict, su: str) -> str:
     if su == "user_message_chunk":
-        text = ((update.get("content") or {}).get("text") or "")[:100]
+        text = user_message_chunk_text(update)
+        if is_system_reminder_text(text):
+            preview = text.strip().replace("\n", " ")[:80]
+            return f"⚙ system-reminder: {preview}"
+        text = text[:100]
         return f"👤 user: {text}" if text else "👤 user message"
     if su == "agent_message_chunk":
         text = ((update.get("content") or {}).get("text") or "")[:100]
@@ -1508,6 +1549,9 @@ def build_timeline(sess_dir: Path, limit: int = 5000, hide_phases: bool = True) 
                 ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
             except Exception:
                 pass
+        # Synthetic injections — not real user turns (hide from timeline)
+        if su == "user_message_chunk" and is_system_reminder_user_update(update):
+            continue
         cat = categorize_update(su)
         items.append(
             {
@@ -1593,10 +1637,14 @@ def build_chat_view(
         update = ((up.get("params") or {}).get("update")) or {}
         su = update.get("sessionUpdate")
         if su == "user_message_chunk":
+            chunk = user_message_chunk_text(update)
+            # Background-task / hook injections — not real user turns
+            if is_system_reminder_text(chunk):
+                continue
             # Next user turn: seal prior tools with everything collected so far
             flush_all_tools()
             flush_agent()
-            buf_user.append(((update.get("content") or {}).get("text")) or "")
+            buf_user.append(chunk)
         elif su == "agent_message_chunk":
             # Keep tools open across agent text within the same turn (accuracy > live partials)
             flush_user()
@@ -1641,6 +1689,16 @@ def build_chat_view(
     flush_user()
     flush_agent()
 
+    # Drop any user rows that are only system-reminder (belt-and-suspenders)
+    messages = [
+        m
+        for m in messages
+        if not (
+            m.get("role") == "user"
+            and is_system_reminder_text(m.get("text") or "")
+        )
+    ]
+
     if messages:
         return messages
 
@@ -1659,6 +1717,8 @@ def build_chat_view(
             content = "\n".join(texts)
         elif not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False) if content is not None else ""
+        if role in ("user", "human") and is_system_reminder_text(content):
+            continue
         messages.append({"role": role, "text": content})
     return messages
 
@@ -1690,6 +1750,8 @@ def prompt_turn_status(sess_dir: Path, prompt_index: int, *, limit: int | None =
         update = ((up.get("params") or {}).get("update")) or {}
         su = update.get("sessionUpdate")
         if su == "user_message_chunk":
+            if is_system_reminder_user_update(update):
+                continue
             if not in_user_chunk:
                 current_prompt += 1
                 in_user_chunk = True
@@ -1857,6 +1919,10 @@ def iter_prompt_turn_updates(sess_dir: Path, limit: int = 5000):
         update = ((up.get("params") or {}).get("update")) or {}
         su = update.get("sessionUpdate")
         if su == "user_message_chunk":
+            if is_system_reminder_user_update(update):
+                # Keep prior turn index; do not open a fake user turn
+                yield current_prompt, update, su
+                continue
             if not in_user_chunk:
                 current_prompt += 1
                 in_user_chunk = True
@@ -2364,55 +2430,105 @@ def default_turn_export_dir() -> Path:
     return TURN_EXPORT_DIR
 
 
-def export_turn_to_file(
+_SLUG_RE = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def slugify(text: str | None, *, max_len: int = 36, fallback: str = "session") -> str:
+    """Filesystem-safe short slug for export folder/file names."""
+    s = " ".join((text or "").split()).strip().lower()
+    s = _SLUG_RE.sub("-", s).strip("-")
+    if not s:
+        s = fallback
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("-")
+    return s or fallback
+
+
+def session_context_slug(
     sess_dir: Path,
-    prompt_index: int,
-    dest: Path | None = None,
     *,
     session_id: str | None = None,
+    session_title: str | None = None,
+) -> str:
+    """``{title-slug}_{sid8}`` for human-navigable export paths."""
+    sid = (session_id or sess_dir.name or "unknown").strip()
+    sid8 = sid[:8] if sid else "unknown"
+    title = session_title
+    if not title:
+        try:
+            summary_path = sess_dir / "summary.json"
+            if summary_path.is_file():
+                data = json.loads(summary_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    title = data.get("generated_title") or data.get("title")
+        except Exception:
+            title = None
+    return f"{slugify(title, fallback='session')}_{sid8}"
+
+
+def turn_folder_name(
+    session_slug: str,
+    prompt_index: int,
+    prompt_text: str | None = None,
+) -> str:
+    """One folder per turn: ``{session_slug}_turn-NNN_{prompt-slug}``."""
+    pslug = slugify(prompt_text, max_len=28, fallback="prompt")
+    return f"{session_slug}_turn-{prompt_index + 1:03d}_{pslug}"
+
+
+def turn_markdown_name(session_slug: str, prompt_index: int) -> str:
+    return f"{session_slug}_turn-{prompt_index + 1:03d}.md"
+
+
+def _unique_child_dir(parent: Path, name: str) -> Path:
+    """Return parent/name, or parent/name-2, … if the path already exists."""
+    parent.mkdir(parents=True, exist_ok=True)
+    candidate = parent / name
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        alt = parent / f"{name}-{n}"
+        if not alt.exists():
+            return alt
+        n += 1
+
+
+def write_turn_export_into(
+    turn_dir: Path,
+    sess_dir: Path,
+    prompt_index: int,
+    *,
+    session_id: str | None = None,
+    session_title: str | None = None,
+    session_slug: str | None = None,
     copy_artifacts: bool = True,
     require_complete: bool = True,
-    settle_seconds: float | None = None,
 ) -> Path:
-    """Write turn bundle under ~/grok-turn-exports (or GROK_ALT_TURN_EXPORT_DIR).
+    """Write one turn into ``turn_dir/`` as markdown + optional ``files/``.
 
     Layout::
 
-        ~/grok-turn-exports/turn-<sid8>-<nnn>.md
-        ~/grok-turn-exports/turn-<sid8>-<nnn>-files/<artifacts>
-
-    By default refuses in-progress turns (require_complete=True). Optional settle
-    delay waits for late log flushes after turn_completed.
+        turn_dir/
+          {session_slug}_turn-NNN.md
+          files/   # artifacts when present
 
     Returns the markdown path.
     """
-    import time
-
-    st = prompt_turn_status(sess_dir, prompt_index)
-    if require_complete and not st.get("complete"):
-        raise TurnIncompleteError(prompt_index, st)
-    wait = TURN_SETTLE_SECONDS if settle_seconds is None else settle_seconds
-    if wait > 0 and st.get("complete") and st.get("reason") == "turn_completed":
-        time.sleep(wait)
-
     bundle = build_turn_bundle(sess_dir, prompt_index, require_complete=require_complete)
     sid = session_id or sess_dir.name
-    stem = f"turn-{sid[:8]}-{prompt_index + 1:03d}"
-    if dest is None:
-        out_dir = default_turn_export_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        dest = out_dir / f"{stem}.md"
-    else:
-        dest = Path(dest).expanduser()
-        if dest.is_dir() or str(dest).endswith(os.sep):
-            dest.mkdir(parents=True, exist_ok=True)
-            dest = dest / f"{stem}.md"
-        else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
+    slug = session_slug or session_context_slug(
+        sess_dir, session_id=sid, session_title=session_title
+    )
+    turn_dir = Path(turn_dir)
+    turn_dir.mkdir(parents=True, exist_ok=True)
+    md_name = turn_markdown_name(slug, prompt_index)
+    dest = turn_dir / md_name
+    files_subdir = "files"
 
     copied: list[dict] = []
     if copy_artifacts and bundle.get("artifacts"):
-        files_dir = dest.parent / f"{stem}-files"
+        files_dir = turn_dir / files_subdir
         files_dir.mkdir(parents=True, exist_ok=True)
         used_names: set[str] = set()
         for art in bundle["artifacts"]:
@@ -2436,7 +2552,7 @@ def export_turn_to_file(
             for c in copied:
                 rel = Path(c["exported_as"]).name
                 extra.append(
-                    f"- [`{rel}`](./{stem}-files/{rel}) — {c['kind']} "
+                    f"- [`{rel}`](./{files_subdir}/{rel}) — {c['kind']} "
                     f"({c['size']} bytes)  \n  source: `{c['path']}`"
                 )
             extra_md = "\n".join(extra) + "\n\n"
@@ -2446,7 +2562,305 @@ def export_turn_to_file(
 
     meta = (
         f"<!-- session={sid} prompt_index={prompt_index} "
-        f"exported_from=grok-alt export_dir={dest.parent} -->\n\n"
+        f"exported_from=grok-alt export_dir={turn_dir} -->\n\n"
     )
     dest.write_text(meta + bundle["markdown"], encoding="utf-8")
     return dest.resolve()
+
+
+def export_turn_to_file(
+    sess_dir: Path,
+    prompt_index: int,
+    dest: Path | None = None,
+    *,
+    session_id: str | None = None,
+    session_title: str | None = None,
+    copy_artifacts: bool = True,
+    require_complete: bool = True,
+    settle_seconds: float | None = None,
+) -> Path:
+    """Export one turn under ~/grok-turn-exports (or GROK_ALT_TURN_EXPORT_DIR).
+
+    Layout (single turn)::
+
+        ~/grok-turn-exports/
+          {title}_{sid8}_turn-NNN_{prompt-slug}/
+            {title}_{sid8}_turn-NNN.md
+            files/   # optional artifacts
+
+    If ``dest`` is a directory, the turn folder is created inside it (batch parent).
+    If ``dest`` is a file path (legacy), parent dir is used as the turn folder and
+    the file name is ignored in favor of the contextual markdown name.
+
+    Returns the markdown path.
+    """
+    import time
+
+    st = prompt_turn_status(sess_dir, prompt_index)
+    if require_complete and not st.get("complete"):
+        raise TurnIncompleteError(prompt_index, st)
+    wait = TURN_SETTLE_SECONDS if settle_seconds is None else settle_seconds
+    if wait > 0 and st.get("complete") and st.get("reason") == "turn_completed":
+        time.sleep(wait)
+
+    sid = session_id or sess_dir.name
+    slug = session_context_slug(sess_dir, session_id=sid, session_title=session_title)
+    # Prompt preview for folder name (cheap: from bundle would re-read; use chat once)
+    prompt_preview = ""
+    try:
+        msgs = build_chat_view(sess_dir, full_detail=False)
+        ui = -1
+        for m in msgs:
+            if m.get("role") == "user":
+                ui += 1
+                if ui == prompt_index:
+                    prompt_preview = m.get("text") or ""
+                    break
+    except Exception:
+        prompt_preview = ""
+
+    folder = turn_folder_name(slug, prompt_index, prompt_preview)
+    if dest is None:
+        turn_dir = _unique_child_dir(default_turn_export_dir(), folder)
+    else:
+        dest = Path(dest).expanduser()
+        if dest.suffix.lower() == ".md" and not (dest.exists() and dest.is_dir()):
+            # Legacy: path to a .md file → create turn folder beside it
+            turn_dir = _unique_child_dir(dest.parent, folder)
+        else:
+            # Directory (or path without .md) → parent for the turn folder
+            parent = dest
+            parent.mkdir(parents=True, exist_ok=True)
+            turn_dir = _unique_child_dir(parent, folder)
+
+    return write_turn_export_into(
+        turn_dir,
+        sess_dir,
+        prompt_index,
+        session_id=sid,
+        session_title=session_title,
+        session_slug=slug,
+        copy_artifacts=copy_artifacts,
+        require_complete=require_complete,
+    )
+
+
+def export_turns_batch(
+    sess_dir: Path,
+    prompt_indices: list[int],
+    *,
+    session_id: str | None = None,
+    session_title: str | None = None,
+    copy_artifacts: bool = True,
+    require_complete: bool = True,
+    settle_seconds: float | None = None,
+    batch_label: str | None = None,
+) -> dict:
+    """Export several turns under one mother folder.
+
+    Layout::
+
+        ~/grok-turn-exports/
+          {title}_{sid8}_{batch_label}/
+            INDEX.md
+            all-turn-md-exports/          # flat copies of each turn .md (no files/)
+              {title}_{sid8}_turn-001.md
+              …
+            {title}_{sid8}_turn-001_…/    # full detail per turn
+              ….md
+              files/
+            …
+
+    Returns dict: mother_dir, markdown_paths, flat_md_paths, skipped, errors.
+    """
+    import time
+    from datetime import datetime as _dt
+
+    if not prompt_indices:
+        raise ValueError("No turn indices to export")
+
+    sid = session_id or sess_dir.name
+    slug = session_context_slug(sess_dir, session_id=sid, session_title=session_title)
+    indices = sorted({int(i) for i in prompt_indices if int(i) >= 0})
+    if not indices:
+        raise ValueError("No valid turn indices to export")
+
+    lo, hi = indices[0] + 1, indices[-1] + 1
+    stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+    label = batch_label or f"turns-{lo:03d}-{hi:03d}_{stamp}"
+    mother_name = f"{slug}_{label}"
+    mother = _unique_child_dir(default_turn_export_dir(), mother_name)
+    mother.mkdir(parents=True, exist_ok=True)
+    # Flat “markdown only” copies of every exported turn (no artifact trees)
+    flat_md_dir = mother / "all-turn-md-exports"
+    flat_md_dir.mkdir(parents=True, exist_ok=True)
+
+    # One settle before batch if any turn just completed
+    wait = TURN_SETTLE_SECONDS if settle_seconds is None else settle_seconds
+    if wait > 0:
+        for pi in indices:
+            st = prompt_turn_status(sess_dir, pi)
+            if st.get("complete") and st.get("reason") == "turn_completed":
+                time.sleep(wait)
+                break
+
+    paths: list[Path] = []
+    flat_md_paths: list[Path] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    index_lines = [
+        f"# Export batch — {slug}",
+        "",
+        f"- session_id: `{sid}`",
+        f"- turns requested: {', '.join(str(i + 1) for i in indices)}",
+        f"- mother: `{mother.name}`",
+        f"- markdown-only copies: [`all-turn-md-exports/`](./all-turn-md-exports/)",
+        "",
+        "## Turns",
+        "",
+    ]
+
+    for pi in indices:
+        st = prompt_turn_status(sess_dir, pi)
+        if require_complete and not st.get("complete"):
+            skipped.append({"prompt_index": pi, "reason": st.get("reason") or "incomplete"})
+            index_lines.append(f"- turn {pi + 1}: **skipped** ({st.get('reason') or 'incomplete'})")
+            continue
+        try:
+            # Prompt text for folder slug
+            prompt_preview = ""
+            try:
+                b = build_turn_bundle(sess_dir, pi, require_complete=False)
+                prompt_preview = b.get("prompt") or ""
+            except Exception:
+                pass
+            tdir = _unique_child_dir(mother, turn_folder_name(slug, pi, prompt_preview))
+            md_path = write_turn_export_into(
+                tdir,
+                sess_dir,
+                pi,
+                session_id=sid,
+                session_title=session_title,
+                session_slug=slug,
+                copy_artifacts=copy_artifacts,
+                require_complete=require_complete,
+            )
+            paths.append(md_path)
+            # Non-detailed: same turn markdown only, collected in one folder
+            flat_name = turn_markdown_name(slug, pi)
+            flat_dest = flat_md_dir / flat_name
+            if flat_dest.exists():
+                # Unlikely (one md name per turn index); keep unique
+                stem, ext = os.path.splitext(flat_name)
+                n = 2
+                while flat_dest.exists():
+                    flat_dest = flat_md_dir / f"{stem}-{n}{ext}"
+                    n += 1
+            try:
+                shutil.copy2(md_path, flat_dest)
+                flat_md_paths.append(flat_dest.resolve())
+            except OSError:
+                # Fall back to reading text if copy fails
+                try:
+                    flat_dest.write_text(md_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    flat_md_paths.append(flat_dest.resolve())
+                except OSError:
+                    pass
+            rel = md_path.relative_to(mother)
+            flat_rel = flat_dest.relative_to(mother) if flat_dest.exists() else None
+            line = f"- turn {pi + 1}: [`{rel}`](./{rel.as_posix()})"
+            if flat_rel is not None:
+                line += f" · [md only](./{flat_rel.as_posix()})"
+            index_lines.append(line)
+        except TurnIncompleteError as e:
+            skipped.append({"prompt_index": pi, "reason": str(e)})
+            index_lines.append(f"- turn {pi + 1}: **skipped** (incomplete)")
+        except Exception as e:
+            errors.append({"prompt_index": pi, "error": f"{type(e).__name__}: {e}"})
+            index_lines.append(f"- turn {pi + 1}: **error** ({type(e).__name__})")
+
+    index_lines.extend(
+        [
+            "",
+            f"Exported {len(paths)} turn(s), skipped {len(skipped)}, errors {len(errors)}.",
+            f"Flat markdown copies: {len(flat_md_paths)} under `all-turn-md-exports/`.",
+            "",
+        ]
+    )
+    (mother / "INDEX.md").write_text("\n".join(index_lines), encoding="utf-8")
+
+    return {
+        "mother_dir": mother.resolve(),
+        "markdown_paths": paths,
+        "flat_md_dir": flat_md_dir.resolve(),
+        "flat_md_paths": flat_md_paths,
+        "skipped": skipped,
+        "errors": errors,
+        "session_slug": slug,
+    }
+
+
+def export_full_chat(
+    sess_dir: Path,
+    *,
+    session_id: str | None = None,
+    session_title: str | None = None,
+    copy_artifacts: bool = True,
+    require_complete: bool = True,
+    settle_seconds: float | None = None,
+) -> dict:
+    """Export every user turn in the session (skips incomplete if require_complete)."""
+    from datetime import datetime as _dt
+
+    msgs = build_chat_view(sess_dir, full_detail=False)
+    n = sum(1 for m in msgs if m.get("role") == "user")
+    if n <= 0:
+        raise ValueError("No user turns in this session")
+    stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+    return export_turns_batch(
+        sess_dir,
+        list(range(n)),
+        session_id=session_id,
+        session_title=session_title,
+        copy_artifacts=copy_artifacts,
+        require_complete=require_complete,
+        settle_seconds=settle_seconds,
+        batch_label=f"full-chat_turns-001-{n:03d}_{stamp}",
+    )
+
+
+def export_turn_range(
+    sess_dir: Path,
+    start_index: int,
+    end_index: int,
+    *,
+    session_id: str | None = None,
+    session_title: str | None = None,
+    copy_artifacts: bool = True,
+    require_complete: bool = True,
+    settle_seconds: float | None = None,
+) -> dict:
+    """Export inclusive 0-based turn range [start_index, end_index]."""
+    from datetime import datetime as _dt
+
+    if start_index < 0 or end_index < start_index:
+        raise ValueError("Invalid turn range")
+    msgs = build_chat_view(sess_dir, full_detail=False)
+    n = sum(1 for m in msgs if m.get("role") == "user")
+    if n <= 0:
+        raise ValueError("No user turns in this session")
+    if start_index >= n:
+        raise ValueError(f"Start turn {start_index + 1} out of range (session has {n} turns)")
+    end_index = min(end_index, n - 1)
+    lo, hi = start_index + 1, end_index + 1
+    stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+    return export_turns_batch(
+        sess_dir,
+        list(range(start_index, end_index + 1)),
+        session_id=session_id,
+        session_title=session_title,
+        copy_artifacts=copy_artifacts,
+        require_complete=require_complete,
+        settle_seconds=settle_seconds,
+        batch_label=f"range-{lo:03d}-{hi:03d}_{stamp}",
+    )

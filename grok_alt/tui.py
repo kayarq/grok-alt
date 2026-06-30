@@ -58,7 +58,9 @@ class HelpScreen(ModalScreen[None]):
   ↑/↓ then Enter  Jump chat view to that prompt + following reply
   Click a row     Same jump (no more scrolling the whole log)
   List scrolls    All turns are selectable (scroll with ↑/↓ or mouse)
-  d / D           Export selected turn → ~/grok-turn-exports (full tools; blocked if turn still running)
+  d              Export selected turn → folder under ~/grok-turn-exports
+  D              Export full chat (all completed turns) → mother folder + per-turn folders
+  y              Ranged export — pick from/to turn numbers (modal)
 
 [b]Chat · tools (click to expand)[/b]
   Each tool is a clickable row (▸ title) — click to open/close details.
@@ -96,6 +98,103 @@ Select a prompt to scroll there and expand that turn's tools. Official Grok: g /
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "help-close":
             self.dismiss()
+
+
+class ExportRangeScreen(ModalScreen[tuple[int, int] | None]):
+    """Pick inclusive 1-based turn range for batch export."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("q", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, turn_count: int, default_from: int = 1, default_to: int | None = None) -> None:
+        super().__init__()
+        self.turn_count = max(0, int(turn_count))
+        self.default_from = max(1, min(int(default_from), self.turn_count or 1))
+        self.default_to = int(default_to) if default_to is not None else self.turn_count
+        if self.turn_count:
+            self.default_to = max(self.default_from, min(self.default_to, self.turn_count))
+
+    def compose(self) -> ComposeResult:
+        n = self.turn_count
+        yield Vertical(
+            Static("[b]Export turn range[/b]", id="er-title"),
+            Static(
+                f"[dim]Session has [b]{n}[/b] user turn(s). "
+                f"Enter 1-based inclusive from / to. Incomplete turns are skipped.[/dim]",
+                id="er-hint",
+            ),
+            Label("From turn #"),
+            Input(
+                value=str(self.default_from),
+                placeholder="1",
+                id="er-from",
+                type="integer",
+            ),
+            Label("To turn #"),
+            Input(
+                value=str(self.default_to if n else 1),
+                placeholder=str(n or 1),
+                id="er-to",
+                type="integer",
+            ),
+            Static("", id="er-error"),
+            Horizontal(
+                Button("Export", variant="primary", id="er-ok"),
+                Button("Cancel", variant="default", id="er-cancel"),
+                id="er-buttons",
+            ),
+            id="export-range-dialog",
+        )
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#er-from", Input).focus()
+        except Exception:
+            pass
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _parse_range(self) -> tuple[int, int] | None:
+        err = self.query_one("#er-error", Static)
+        if self.turn_count <= 0:
+            err.update("[red]No user turns in this session[/red]")
+            return None
+        try:
+            lo = int((self.query_one("#er-from", Input).value or "").strip())
+            hi = int((self.query_one("#er-to", Input).value or "").strip())
+        except ValueError:
+            err.update("[red]From and To must be integers[/red]")
+            return None
+        if lo < 1 or hi < 1:
+            err.update("[red]Turn numbers are 1-based (≥ 1)[/red]")
+            return None
+        if lo > hi:
+            err.update("[red]From must be ≤ To[/red]")
+            return None
+        if lo > self.turn_count:
+            err.update(f"[red]From {lo} is past last turn ({self.turn_count})[/red]")
+            return None
+        hi = min(hi, self.turn_count)
+        err.update("")
+        return lo, hi
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "er-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "er-ok":
+            r = self._parse_range()
+            if r is not None:
+                self.dismiss(r)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id in ("er-from", "er-to"):
+            r = self._parse_range()
+            if r is not None:
+                self.dismiss(r)
 
 
 class GrokAltApp(App):
@@ -136,19 +235,30 @@ class GrokAltApp(App):
         padding: 0 1;
     }
 
-    TabbedContent { height: 1fr; width: 100%; }
-    TabPane { width: 100%; height: 1fr; }
+    TabbedContent { height: 1fr; width: 1fr; }
+    TabPane { width: 1fr; height: 1fr; }
 
     RichLog {
         background: #0d1117;
         color: #e6edf3;
         height: 1fr;
-        width: 100%;
-        min-width: 1;
+        width: 1fr;
+        min-width: 24;
         border: none;
         scrollbar-background: #161b22;
         scrollbar-color: #30363d;
         overflow-x: auto;
+    }
+
+    /* Timeline / overview / logs: avoid 1-cell wrap (vertical “Japanese” text) */
+    #log-timeline, #log-overview, #log-unified {
+        width: 1fr;
+        min-width: 24;
+    }
+
+    TabbedContent > ContentSwitcher {
+        width: 1fr;
+        height: 1fr;
     }
 
     #chat-pane { height: 1fr; width: 100%; }
@@ -277,6 +387,20 @@ class GrokAltApp(App):
     }
     #help-title { color: #58a6ff; margin-bottom: 1; }
     #help-body { color: #e6edf3; }
+
+    #export-range-dialog {
+        width: 56;
+        height: auto;
+        background: #161b22;
+        border: solid #3fb950;
+        padding: 1 2;
+    }
+    #export-range-dialog #er-title { color: #3fb950; margin-bottom: 1; }
+    #export-range-dialog #er-hint { color: #8b949e; margin-bottom: 1; }
+    #export-range-dialog Input { margin: 0 0 1 0; }
+    #export-range-dialog #er-error { color: #f85149; height: auto; min-height: 1; margin-bottom: 1; }
+    #export-range-dialog #er-buttons { height: auto; margin-top: 1; }
+    #export-range-dialog #er-buttons Button { margin-right: 1; }
     """
 
     # priority=True: work even when focus is on ListView / Input / RichLog (tmux UX)
@@ -290,7 +414,8 @@ class GrokAltApp(App):
         Binding("c", "continue_grok", "Continue", priority=True),
         Binding("R", "resume_grok", "Resume", priority=True),
         Binding("d", "export_turn", "ExportTurn", priority=True),
-        Binding("D", "export_turn", "ExportTurn", show=False, priority=True),
+        Binding("D", "export_full_chat", "ExportAll", priority=True),
+        Binding("y", "export_range", "ExportRange", priority=True),
         Binding("p", "toggle_phases", "Phases", priority=True),
         Binding("t", "toggle_tools", "Tools", priority=True),
         Binding("e", "toggle_tool_expand", "Expand", priority=True),
@@ -421,7 +546,8 @@ class GrokAltApp(App):
                             markup=True,
                             wrap=True,
                             auto_scroll=False,
-                            min_width=1,
+                            # Floor for wrap width — min_width=1 + wrap made one char per line
+                            min_width=40,
                         )
                     with TabPane("Chat", id="chat"):
                         with Vertical(id="chat-pane"):
@@ -446,7 +572,7 @@ class GrokAltApp(App):
                             markup=True,
                             wrap=True,
                             auto_scroll=False,
-                            min_width=1,
+                            min_width=40,
                         )
                     with TabPane("Logs", id="logs"):
                         yield RichLog(
@@ -455,7 +581,7 @@ class GrokAltApp(App):
                             markup=True,
                             wrap=True,
                             auto_scroll=False,
-                            min_width=1,
+                            min_width=40,
                         )
                     with TabPane("Diffs", id="diffs"):
                         with Horizontal(id="diffs-pane"):
@@ -989,12 +1115,14 @@ class GrokAltApp(App):
                     meta += f" · {s['events_count']}ev"
                 # Generation + index: unique even if a prior clear left orphans behind.
                 item_id = f"si{gen}-{shown}"
-                lv.append(
-                    ListItem(
-                        Label(f"[b]{self._escape(title)}[/b]\n[dim]{self._escape(meta)}[/dim]"),
-                        id=item_id,
-                    )
+                item = ListItem(
+                    Label(f"[b]{self._escape(title)}[/b]\n[dim]{self._escape(meta)}[/dim]"),
+                    id=item_id,
                 )
+                tip = self._session_tooltip(s)
+                if tip:
+                    item.tooltip = tip
+                lv.append(item)
                 self._by_id[item_id] = s
                 if prev_sid and sid == prev_sid:
                     highlight_index = shown
@@ -1138,14 +1266,65 @@ class GrokAltApp(App):
             return ""
         return rich_escape(str(text))
 
+    @staticmethod
+    def _tooltip_text(text: str, *, max_chars: int = 1200) -> str:
+        """Plain tooltip body (no markup). Cap length so hover stays usable."""
+        s = (text or "").strip()
+        if not s:
+            return ""
+        if len(s) <= max_chars:
+            return s
+        return s[: max_chars - 1] + "…"
+
+    @staticmethod
+    def _session_tooltip(s: dict) -> str:
+        """Hover details for a sidebar session row."""
+        title = (s.get("title") or "(untitled)").strip()
+        lines = [title]
+        cwd = (s.get("cwd") or "").strip()
+        if cwd:
+            lines.append(f"cwd: {cwd}")
+        sid = (s.get("id") or "").strip()
+        if sid:
+            lines.append(f"id: {sid}")
+        model = (s.get("model") or "").strip()
+        if model:
+            lines.append(f"model: {model}")
+        updated = core.fmt_date(s.get("updated_at"))
+        if updated:
+            lines.append(f"updated: {updated}")
+        bits = []
+        if s.get("events_count"):
+            bits.append(f"{s['events_count']} events")
+        if s.get("updates_count"):
+            bits.append(f"{s['updates_count']} updates")
+        if bits:
+            lines.append(" · ".join(bits))
+        summary = (s.get("summary") or "").strip()
+        if summary and summary != title:
+            lines.append("")
+            lines.append(summary)
+        return GrokAltApp._tooltip_text("\n".join(lines))
+
+    @staticmethod
+    def _prompt_tooltip(index: int, total: int, text: str) -> str:
+        """Hover details for a Chat “Your prompts” row (full turn text)."""
+        body = (text or "").strip() or "(empty prompt)"
+        head = f"Turn {index + 1} of {total}"
+        return GrokAltApp._tooltip_text(f"{head}\n\n{body}")
+
     def _log_write(self, log: RichLog, line: str) -> None:
-        """Write to RichLog; never let a single bad line kill the app."""
+        """Write to RichLog; never let a single bad line kill the app.
+
+        expand=True uses the full pane width when known; combined with a sane
+        RichLog.min_width this avoids 1-column wrap (vertical glyph stack).
+        """
         try:
-            log.write(line)
+            log.write(line, expand=True)
         except Exception:
             try:
                 # Fallback: plain text, no markup interpretation
-                log.write(Text(str(line)))
+                log.write(Text(str(line)), expand=True)
             except Exception:
                 pass
 
@@ -1706,7 +1885,11 @@ class GrokAltApp(App):
                     f"[bold bright_green]#{i + 1}[/bold bright_green]  "
                     f"[dim]{i + 1}/{total}[/dim]\n{preview}"
                 )
-                lv.append(ListItem(Label(label), id=f"pn{gen}-{i}"))
+                item = ListItem(Label(label), id=f"pn{gen}-{i}")
+                tip = self._prompt_tooltip(i, total, text)
+                if tip:
+                    item.tooltip = tip
+                lv.append(item)
             # Prefer selected prompt; else last (most recent)
             hi = prefer_idx if prefer_idx is not None else total - 1
             if hi < 0:
@@ -1721,7 +1904,7 @@ class GrokAltApp(App):
             hdr = self.query_one("#prompt-nav-header", Static)
             hdr.update(
                 f"[b]Your prompts[/b]  [dim]· {total} turn(s) · "
-                f"↑/↓ scrolls full list · Enter jump · d = export (after turn finishes)[/dim]"
+                f"↑/↓ · Enter jump · d turn · D full chat · y range[/dim]"
             )
             # Defer scroll; ignore if another rebuild happened (gen mismatch)
             try:
@@ -2196,36 +2379,62 @@ class GrokAltApp(App):
         self.exit(result=("exec", args, work_dir))
 
 
-    def action_export_turn(self) -> None:
-        """Save selected turn as markdown: ## Prompt / ## Trace / ## Response.
-
-        Blocks while the turn is still in progress (accuracy over partial exports).
-        """
+    def _export_session_meta(self) -> tuple[Path, str | None, str | None] | None:
+        """Resolve sess_dir + id + title for exports, or notify and return None."""
         if not self.selected:
-            self.set_status("Select a session first, then pick a prompt and press d")
+            self.set_status("Select a session first")
             self.notify("No session selected", severity="warning")
-            return
+            return None
         sess_dir = self._sess_dir()
         if not sess_dir:
             self.notify("Session path not found", severity="error")
-            return
-        # Prefer explicit prompt selection; else last prompt in nav / session
+            return None
+        return (
+            sess_dir,
+            self.selected.get("id"),
+            self.selected.get("title"),
+        )
+
+    def _resolve_export_prompt_index(self) -> int | None:
         idx = self._selected_prompt_index
         if idx is None:
             idx = self._resolve_prompt_index_for_diffs()
         if idx is None:
-            # Try ListView highlight
             try:
                 lv = self.query_one("#prompt-nav", ListView)
                 if lv.index is not None and lv.index >= 0:
                     idx = int(lv.index)
             except Exception:
                 pass
+        return int(idx) if idx is not None else None
+
+    def _notify_batch_export(self, result: dict, *, kind: str) -> None:
+        mother = result.get("mother_dir")
+        n_ok = len(result.get("markdown_paths") or [])
+        n_skip = len(result.get("skipped") or [])
+        n_err = len(result.get("errors") or [])
+        extra = ""
+        if n_skip:
+            extra += f", skipped {n_skip}"
+        if n_err:
+            extra += f", errors {n_err}"
+        self.set_status(f"{kind}: {n_ok} turn(s){extra} → {mother}")
+        self.notify(f"{kind}: {n_ok} turn(s) → {Path(str(mother)).name}{extra}")
+
+    def action_export_turn(self) -> None:
+        """Save selected turn as folder: markdown + files/ under ~/grok-turn-exports.
+
+        Blocks while the turn is still in progress (accuracy over partial exports).
+        """
+        meta = self._export_session_meta()
+        if not meta:
+            return
+        sess_dir, sid, title = meta
+        idx = self._resolve_export_prompt_index()
         if idx is None:
             self.set_status("No prompt/turn to export — open Chat (2) and select a prompt")
             self.notify("Pick a prompt in Chat first", severity="warning")
             return
-        idx = int(idx)
         turn_st = core.prompt_turn_status(sess_dir, idx)
         if not turn_st.get("complete"):
             msg = (
@@ -2242,7 +2451,8 @@ class GrokAltApp(App):
             path = core.export_turn_to_file(
                 sess_dir,
                 idx,
-                session_id=self.selected.get("id"),
+                session_id=sid,
+                session_title=title,
                 require_complete=True,
             )
         except core.TurnIncompleteError as e:
@@ -2254,14 +2464,94 @@ class GrokAltApp(App):
             self.set_status(f"export error: {type(e).__name__}: {e}")
             return
         self._selected_prompt_index = idx
-        files_dir = path.parent / f"{path.stem}-files"
+        files_dir = path.parent / "files"
         extra = ""
         if files_dir.is_dir():
             n = sum(1 for _ in files_dir.iterdir() if _.is_file())
             if n:
-                extra = f" + {n} file(s) in {files_dir.name}/"
-        self.set_status(f"Exported turn #{idx + 1} → {path}{extra}")
-        self.notify(f"Saved {path.name}{extra}")
+                extra = f" + {n} file(s) in files/"
+        self.set_status(f"Exported turn #{idx + 1} → {path.parent.name}/{path.name}{extra}")
+        self.notify(f"Saved {path.parent.name}/{path.name}{extra}")
+
+    def action_export_full_chat(self) -> None:
+        """Export all completed turns into one mother folder (per-turn subfolders)."""
+        meta = self._export_session_meta()
+        if not meta:
+            return
+        sess_dir, sid, title = meta
+        try:
+            result = core.export_full_chat(
+                sess_dir,
+                session_id=sid,
+                session_title=title,
+                require_complete=True,
+            )
+        except ValueError as e:
+            self.notify(str(e), severity="warning")
+            self.set_status(str(e))
+            return
+        except Exception as e:
+            self.notify(f"Full chat export failed: {e}", severity="error")
+            self.set_status(f"export error: {type(e).__name__}: {e}")
+            return
+        if not result.get("markdown_paths") and result.get("skipped"):
+            self.notify("No completed turns to export (all incomplete)", severity="warning")
+        self._notify_batch_export(result, kind="Full chat export")
+
+    def action_export_range(self) -> None:
+        """Open modal to choose inclusive turn range, then batch-export."""
+        meta = self._export_session_meta()
+        if not meta:
+            return
+        sess_dir, sid, title = meta
+        n = len(self._prompt_texts) if self._prompt_texts else 0
+        if n <= 0:
+            try:
+                msgs = core.build_chat_view(sess_dir, full_detail=False)
+                n = sum(1 for m in msgs if m.get("role") == "user")
+            except Exception:
+                n = 0
+        if n <= 0:
+            self.notify("No user turns in this session", severity="warning")
+            return
+        default_from = 1
+        default_to = n
+        if self._selected_prompt_index is not None:
+            default_from = int(self._selected_prompt_index) + 1
+            default_to = default_from
+
+        def _on_range(choice: tuple[int, int] | None) -> None:
+            if not choice:
+                self.set_status("Range export cancelled")
+                return
+            lo_1, hi_1 = choice
+            try:
+                result = core.export_turn_range(
+                    sess_dir,
+                    lo_1 - 1,
+                    hi_1 - 1,
+                    session_id=sid,
+                    session_title=title,
+                    require_complete=True,
+                )
+            except ValueError as e:
+                self.notify(str(e), severity="warning")
+                self.set_status(str(e))
+                return
+            except Exception as e:
+                self.notify(f"Range export failed: {e}", severity="error")
+                self.set_status(f"export error: {type(e).__name__}: {e}")
+                return
+            if not result.get("markdown_paths") and result.get("skipped"):
+                self.notify("No completed turns in range", severity="warning")
+            self._notify_batch_export(
+                result, kind=f"Range export turns {lo_1}–{hi_1}"
+            )
+
+        self.push_screen(
+            ExportRangeScreen(n, default_from=default_from, default_to=default_to),
+            _on_range,
+        )
 
 
 def run_tui() -> int:
